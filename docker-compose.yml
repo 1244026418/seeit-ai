@@ -1,0 +1,77 @@
+name: seeit-ai
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: media_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - seeit_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  rmqnamesrv:
+    image: apache/rocketmq:4.9.4
+    command: sh mqnamesrv
+    ports:
+      - "9876:9876"
+
+  rmqbroker:
+    image: apache/rocketmq:4.9.4
+    command: sh mqbroker -n rmqnamesrv:9876
+    environment:
+      NAMESRV_ADDR: rmqnamesrv:9876
+    depends_on:
+      - rmqnamesrv
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+
+  api:
+    build: ./backend
+    ports:
+      - "9090:9090"
+    environment: &app_environment
+      DATABASE_URL: mysql+pymysql://root:root@mysql:3306/media_db?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      ROCKETMQ_NAMESERVER: rmqnamesrv:9876
+      ROCKETMQ_TOPIC: video-analysis-topic
+      JWT_SECRET: change-this-before-deploying
+      UPLOAD_ROOT: /data/uploads
+      CORS_ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    volumes:
+      - seeit_uploads:/data/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rmqbroker:
+        condition: service_started
+
+  worker:
+    build: ./backend
+    command: python -m seeit.worker
+    environment: *app_environment
+    volumes:
+      - seeit_uploads:/data/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rmqbroker:
+        condition: service_started
+
+volumes:
+  seeit_mysql:
+  seeit_uploads:
