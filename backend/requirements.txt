@@ -1,6 +1,7 @@
 fastapi==0.115.6
 uvicorn[standard]==0.33.0
 sqlalchemy==2.0.37
+alembic==1.14.0
 pymysql==1.1.1
 python-multipart==0.0.20
 PyJWT==2.9.0

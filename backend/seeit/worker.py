@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import threading
@@ -11,6 +12,7 @@ from rocketmq.client import ConsumeStatus, PushConsumer
 from seeit.main import process_analysis
 
 load_dotenv()
+log = logging.getLogger("seeit.worker")
 
 
 def main() -> None:
@@ -21,9 +23,15 @@ def main() -> None:
     consumer.set_namesrv_addr(nameserver)
 
     def handle(message):
-        payload = json.loads(message.body.decode("utf-8"))
-        process_analysis(payload["taskId"])
-        return ConsumeStatus.CONSUME_SUCCESS
+        try:
+            payload = json.loads(message.body.decode("utf-8"))
+            outcome = process_analysis(payload["taskId"])
+            if outcome == "RETRYING":
+                return ConsumeStatus.RECONSUME_LATER
+            return ConsumeStatus.CONSUME_SUCCESS
+        except Exception:
+            log.exception("analysis_message_failed message_id=%s", getattr(message, "id", "unknown"))
+            return ConsumeStatus.RECONSUME_LATER
 
     consumer.subscribe(topic, handle)
     consumer.start()

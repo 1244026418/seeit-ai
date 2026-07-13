@@ -63,34 +63,9 @@
                     <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
                   </div>
                   <span class="magnet-title">上传本地视频</span>
-                  <span class="magnet-desc">{{ isDragOver ? '松手开始上传' : '点击选择或拖入文件' }}</span>
+                  <span class="magnet-desc">{{ isDragOver ? '松手开始上传' : '点击选择或拖入文件，支持断点续传' }}</span>
                 </div>
               </label>
-
-              <div class="split-gap"></div>
-
-              <div class="skew-pane pane-url">
-                <div class="pane-content unskew">
-                  <div class="magnet-icon">
-                    <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1 4-10z"></path></svg>
-                  </div>
-                  <span class="magnet-title">导入视频链接</span>
-                  <span class="magnet-desc">B站、YouTube、抖音</span>
-
-                  <div class="url-input-box" @click.stop>
-                    <input
-                        v-model="videoUrl"
-                        type="text"
-                        placeholder="粘贴视频链接..."
-                        @keyup.enter="handleUrlUpload"
-                    />
-                    <button class="url-go-btn" @click="handleUrlUpload">
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-                    </button>
-                  </div>
-                </div>
-              </div>
-
             </div>
 
             <div class="magnet-content busy" v-else>
@@ -128,7 +103,7 @@
                 <div class="meta-tags">
                   <span class="time-tag">{{ formatTime(item.uploadTime) }}</span>
                   <span class="status-indicator" :class="item.status.toLowerCase()">
-                    {{ item.status === 'COMPLETED' ? '已完成' : '处理中' }}
+                    {{ item.status === 'COMPLETED' ? '已完成' : item.status === 'FAILED' ? '失败' : '处理中' }}
                   </span>
                 </div>
               </div>
@@ -290,7 +265,6 @@ const DEMO_MODE = new URLSearchParams(window.location.search).has('demo')
 const DEFAULT_GOAL = '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议'
 const goalPresets = ['生成学习笔记', '提炼会议结论', '梳理操作步骤']
 const file = ref(null)
-const videoUrl = ref('')
 const message = ref('')
 const uploading = ref(false)
 const list = ref([])
@@ -384,7 +358,6 @@ const handleFileChange = async (e) => {
     return
   }
   file.value = selectedFile
-  videoUrl.value = ''
   await uploadFile()
 }
 
@@ -403,7 +376,6 @@ const handleDrop = async (e) => {
     return
   }
   file.value = selectedFile
-  videoUrl.value = ''
   await uploadFile()
 }
 
@@ -441,9 +413,8 @@ const uploadFile = async () => {
         totalChunks: String(totalChunks)
       })
       const initRes = await apiRequest(`/media/init-upload?${params}`, { method: 'POST' })
-      const initText = await initRes.text()
-      if (!initRes.ok) throw new Error(initText || 'Failed to initialize upload')
-      uploadId = initText
+      if (!initRes.ok) throw new Error(await initRes.text() || '初始化上传失败')
+      uploadId = await initRes.json()
       localStorage.setItem(storageKey, uploadId)
     }
 
@@ -465,7 +436,7 @@ const uploadFile = async () => {
           method: 'POST',
           body: formData
         })
-        if (!chunkRes.ok) throw new Error(await chunkRes.text() || `Chunk ${index} failed`)
+        if (!chunkRes.ok) throw new Error(await chunkRes.text() || `分片 ${index} 上传失败`)
         completedChunks++
         message.value = `正在上传分片 ${completedChunks}/${totalChunks}...`
       }
@@ -477,7 +448,7 @@ const uploadFile = async () => {
     message.value = '分片上传完成，正在合并文件...'
     const completeParams = new URLSearchParams({ uploadId })
     const completeRes = await apiRequest(`/media/complete-upload?${completeParams}`, { method: 'POST' })
-    if (!completeRes.ok) throw new Error(await completeRes.text() || 'Upload merge failed')
+    if (!completeRes.ok) throw new Error(await completeRes.text() || '文件合并失败')
 
     localStorage.removeItem(storageKey)
     showMsg('✅ 本地上传完成')
@@ -485,61 +456,6 @@ const uploadFile = async () => {
   } catch (error) {
     console.error(error)
     showMsg('❌ 上传失败: ' + error.message, true)
-  } finally {
-    uploading.value = false
-  }
-}
-
-// 【链接上传 - 修复版】
-const handleUrlUpload = async () => {
-  if (!videoUrl.value) return
-  if (DEMO_MODE) {
-    videoUrl.value = ''
-    showMsg('演示模式：已模拟完成链接解析')
-    return
-  }
-
-  if (!currentUser.value) {
-    showMsg('⚠️ 权限受限：请先登录系统', true)
-    openAuthModal()
-    return
-  }
-
-  let parsedUrl
-  try {
-    parsedUrl = new URL(videoUrl.value)
-  } catch {
-    parsedUrl = null
-  }
-  if (!parsedUrl || !['http:', 'https:'].includes(parsedUrl.protocol)) {
-    showMsg('⚠️ 请输入合法的 http/https 链接', true)
-    return
-  }
-
-  uploading.value = true
-  message.value = '正在解析链接并极速下载 (低码率模式)...'
-
-  const formData = new FormData()
-  formData.append('url', videoUrl.value)
-
-  try {
-    const res = await apiRequest('/media/upload-url', {
-      method: 'POST',
-      body: formData
-    })
-    // 【关键修复】现在后端会返回 500 状态码，这里能正确捕获错误了
-    const text = await res.text()
-    if (!res.ok) throw new Error(text)
-
-    showMsg('✅ 链接资源已入库')
-    videoUrl.value = ''
-    fetchList()
-  } catch (error) {
-    console.error(error)
-    // 提取后端传来的具体错误信息
-    let errMsg = error.message
-    if (errMsg.includes("Unsupported URL")) errMsg = "不支持该平台链接"
-    showMsg('❌ 解析失败: ' + errMsg, true)
   } finally {
     uploading.value = false
   }
@@ -920,7 +836,7 @@ const handleAuth = async () => {
         setTimeout(() => switchAuthMode(), 1000)
       }
     } else {
-      authMessage.value = data.msg || '操作失败'
+      authMessage.value = data.message || '操作失败'
       authError.value = true
     }
   } catch (e) {
@@ -1413,7 +1329,7 @@ html, body, #app {
 
 .app-stage .split-container {
   display: grid !important;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
 }
 
 .app-stage .skew-pane {
@@ -1425,7 +1341,7 @@ html, body, #app {
 }
 
 .app-stage .pane-local {
-  border-right: 1px solid var(--border-tech) !important;
+  border-right: 0 !important;
 }
 
 .app-stage .skew-pane:hover {
@@ -1574,6 +1490,12 @@ html, body, #app {
   border-color: #efb4ac !important;
   background: #fff0ee !important;
   color: #a33b2f !important;
+}
+
+.app-stage .status-indicator.failed {
+  border-color: #d86b5f !important;
+  background: #fff0ee !important;
+  color: #8b2f27 !important;
 }
 
 .app-stage .action-dock {

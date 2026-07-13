@@ -1,6 +1,6 @@
 # SeeIt AI 前端
 
-本目录是 SeeIt AI 的 Vue 3 前端，提供视频上传、任务列表、分析进度、证据报告、继续追问和用户认证界面。
+本目录是 SeeIt AI 的 Vue 3 前端，提供本地视频分片上传、断点续传、任务列表、分析进度、证据报告、继续追问和用户认证界面。
 
 ## 本地启动
 
@@ -12,7 +12,7 @@ npm install
 npm run dev
 ```
 
-页面默认运行在 `http://localhost:5173`，后端 API 默认地址为 `http://localhost:9090`。需要修改 API 地址时，可设置环境变量：
+页面默认运行在 `http://localhost:5173`，后端 API 默认地址为 `http://localhost:9090`。当前页面只开放本地视频上传，链接导入等外部下载能力需要单独完成安全审计后再接入。需要修改 API 地址时，可设置环境变量：
 
 ```bash
 VITE_API_BASE_URL=http://localhost:9090

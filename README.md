@@ -6,11 +6,13 @@
 
 - JWT 登录与用户资源隔离
 - 大文件分片上传、断点查询与 MD5 内容指纹
+- 分片原子写入、用户级内容去重和上传异常恢复
 - MySQL 持久化与 Redis 重复任务锁
 - RocketMQ 异步分析任务与独立 Worker
-- FFmpeg 音频提取及 OpenAI 兼容 ASR 接口
+- FFmpeg 音频提取、ASR 时间戳片段和可选 OCR 关键帧证据
 - 可替换的 AI Provider 与离线 Mock 演示
-- 分析计划、执行轨迹、证据报告、继续追问和任务状态查询
+- 分析计划、执行轨迹、证据引用评估、继续追问和任务状态查询
+- Alembic 数据库迁移、失败重试、重复消息幂等和 Pytest 接口测试
 
 ## 架构
 
@@ -62,6 +64,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
+python -m alembic upgrade head
 uvicorn seeit.main:app --reload --port 9090
 ```
 
@@ -74,22 +77,20 @@ cd backend
 pytest -q
 ```
 
-当前接口测试覆盖：注册、JWT、分片上传、文件合并、媒体列表、分析提交、后台执行与结果轮询。
+当前接口测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、失败重试、证据评估和反馈持久化。
 
 ## 项目结构
 
 ```text
 backend/                       Python/FastAPI 后端
+backend/alembic/               数据库迁移脚本
 client/                        Vue 3 前端
 docker-compose.yml             MySQL、Redis、RocketMQ、API 与 Worker
 ```
 
 ## 后续改进
 
-1. 使用 Alembic 管理数据库迁移与索引。
-2. 使用 MinIO 保存视频和关键帧，替换共享 Docker volume。
-3. 按时间窗口执行 ASR，并持久化真实时间戳片段。
-4. 抽取关键帧、执行 OCR，并与 ASR 按时间轴融合。
-5. 增加 RocketMQ 重试、死信队列、消费幂等和故障恢复测试。
-6. 建立离线评测集，量化证据覆盖率和幻觉率。
-7. 补充并发上传、越权访问、重复分片和异常恢复测试。
+1. 使用 MinIO 保存视频、音频和关键帧，替换共享 Docker volume。
+2. 在 GitHub Actions 中启动 MySQL、Redis 和 RocketMQ，增加真实组件集成测试。
+3. 建立离线评测集，量化证据覆盖率、时间戳命中率和结构化输出成功率。
+4. 增加任务耗时、失败率、队列积压和 Provider 调用情况等可观测指标。
