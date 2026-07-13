@@ -15,18 +15,18 @@
 ## 架构
 
 ```text
-Vue 3 Client
+Vue 3 前端
     |
-FastAPI API
-    |-- MySQL: users / media / upload sessions / analysis tasks
-    |-- Redis: active-task lock
-    |-- RocketMQ: analysis messages
-    |-- Shared media storage
+FastAPI API 服务
+    |-- MySQL：用户 / 视频 / 上传会话 / 分析任务
+    |-- Redis：活跃任务锁
+    |-- RocketMQ：分析任务消息
+    |-- 共享媒体存储
     |
 RocketMQ Worker
     |-- FFmpeg / ASR
     |-- AI Provider
-    `-- structured evidence report
+    `-- 结构化证据报告
 ```
 
 ## 快速启动
@@ -58,7 +58,7 @@ npm run dev
 ```bash
 cd backend
 python -m venv .venv
-# Windows
+# Windows 激活虚拟环境
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
@@ -93,7 +93,3 @@ docker-compose.yml             MySQL、Redis、RocketMQ、API 与 Worker
 5. 增加 RocketMQ 重试、死信队列、消费幂等和故障恢复测试。
 6. 建立离线评测集，量化证据覆盖率和幻觉率。
 7. 补充并发上传、越权访问、重复分片和异常恢复测试。
-
-## 许可
-
-SeeIt AI 的 Python 后端、任务模型和视觉系统经过独立重写。项目保留适用于衍生部分的 MIT 许可声明。

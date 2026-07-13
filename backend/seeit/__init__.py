@@ -1,1 +1,1 @@
-"""Python backend for SeeIt AI."""
+"""SeeIt AI 的 Python 后端。"""

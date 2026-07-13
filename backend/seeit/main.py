@@ -314,7 +314,7 @@ def active_task_key(media_id: int, goal: str) -> str:
 
 
 def publish_analysis(task_id: str) -> None:
-    """Publish through RocketMQ when configured; otherwise run in the local executor."""
+    """配置 RocketMQ 时投递消息，否则使用本地执行器处理任务。"""
     global _rocketmq_producer
     nameserver = env("ROCKETMQ_NAMESERVER")
     if not nameserver:

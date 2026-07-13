@@ -128,7 +128,7 @@
                 <div class="meta-tags">
                   <span class="time-tag">{{ formatTime(item.uploadTime) }}</span>
                   <span class="status-indicator" :class="item.status.toLowerCase()">
-                    {{ item.status === 'COMPLETED' ? 'READY' : 'PROCESSING' }}
+                    {{ item.status === 'COMPLETED' ? '已完成' : '处理中' }}
                   </span>
                 </div>
               </div>
@@ -250,15 +250,15 @@
           </div>
           <div class="auth-body">
             <div class="input-group">
-              <label>USERNAME</label>
+              <label>账号</label>
               <input v-model="authForm.username" type="text" placeholder="输入账号" />
             </div>
             <div class="input-group">
-              <label>PASSWORD</label>
+              <label>密码</label>
               <input v-model="authForm.password" type="password" placeholder="输入密码" />
             </div>
             <div class="input-group" v-if="authMode === 'register'">
-              <label>NICKNAME (昵称)</label>
+              <label>昵称</label>
               <input v-model="authForm.nickname" type="text" placeholder="设置一个好听的名字" />
             </div>
             <div class="auth-action">
@@ -659,7 +659,7 @@ const transcribe = async (id) => {
     if (!response.ok) throw new Error(await response.text())
     startPolling(id, 'text')
   } catch (e) {
-    sidebar.value.content = "Error: " + e
+    sidebar.value.content = "错误：" + e
     sidebar.value.loading = false
   }
 }
@@ -690,7 +690,7 @@ const aiAnalyze = async (id, goal) => {
     refreshAgentMeta(id, goal, false)
 
   } catch (e) {
-    sidebar.value.content = "Error: " + e
+    sidebar.value.content = "错误：" + e
     sidebar.value.loading = false
   }
 }
@@ -743,7 +743,7 @@ const startPolling = (id, type, goal = '') => {
         await finish(status.result || '')
       }
     } catch (error) {
-      console.error('task polling failed', error)
+      console.error('任务状态轮询失败', error)
     } finally {
       polling.inFlight = false
     }
@@ -831,7 +831,7 @@ const refreshAgentMeta = async (id, goal, includeEvaluation) => {
       if (evaluationText) sidebar.value.evaluation = JSON.parse(evaluationText)
     }
   } catch (error) {
-    console.warn('Agent metadata unavailable', error)
+    console.warn('Agent 元数据暂不可用', error)
   }
 }
 
@@ -956,7 +956,7 @@ const handleAuthExpired = () => {
 onMounted(() => {
   window.addEventListener('auth-expired', handleAuthExpired)
   if (DEMO_MODE) {
-    currentUser.value = { id: 1, nickname: 'Agent Demo' }
+    currentUser.value = { id: 1, nickname: '演示用户' }
     list.value = [DEMO_ITEM]
     openAgent(DEMO_ITEM)
     showDemoResult()
@@ -1026,7 +1026,7 @@ html, body, #app {
 .status-dot { width: 6px; height: 6px; background: var(--accent-lime); border-radius: 50%; }
 .status-pill.is-active .status-dot { animation: pulse-lime 1.5s infinite alternate; }
 
-/* Hero */
+/* 核心操作区 */
 .main-container { max-width: 1200px; margin: 0 auto; padding: 4rem 2rem; }
 .hero-section { text-align: center; margin-bottom: 6rem; animation: slideUpFade 0.8s forwards; }
 .slogan-main { font-family: 'Syncopate', sans-serif; font-size: clamp(2.5rem, 6vw, 4.5rem); font-weight: 700; margin-bottom: 0.5rem; text-shadow: 0 0 20px rgba(197, 249, 70, 0.2); }
@@ -1122,7 +1122,7 @@ html, body, #app {
 .quantum-loader { width: 50px; height: 50px; border: 4px solid var(--border-tech); border-top-color: var(--accent-lime); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 1rem; box-shadow: 0 0 10px var(--accent-lime); }
 .quantum-loader.small { width: 30px; height: 30px; margin: 0 auto; }
 
-/* Workspace */
+/* 视频任务区 */
 .workspace-section { opacity: 0; animation: slideUpFade 0.8s 0.4s forwards; }
 .section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 2rem; border-bottom: 2px solid var(--border-tech); padding-bottom: 10px; }
 .section-header h3 { font-size: 1.5rem; font-weight: 700; }
@@ -1149,7 +1149,7 @@ html, body, #app {
 .dock-item.ai-core:hover:not(:disabled) { border-color: var(--accent-lime); color: var(--text-inverse); background: var(--accent-lime); }
 .dock-item.ai-core:hover:not(:disabled) .item-sub { color: var(--text-inverse); }
 
-/* Sidebar */
+/* 分析侧边栏 */
 .sidebar-backdrop { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 998; }
 .sidebar-panel { position: fixed; top: 0; right: -600px; width: 550px; max-width: 90vw; height: 100%; background: var(--bg-card); border-left: 2px solid var(--accent-lime); z-index: 999; transition: right 0.4s cubic-bezier(0.19, 1, 0.22, 1); display: flex; flex-direction: column; box-shadow: -10px 0 40px rgba(0,0,0,0.8); }
 .sidebar-panel.is-open { right: 0; }
@@ -1169,7 +1169,7 @@ html, body, #app {
 .markdown-content strong { color: var(--accent-lime); font-weight: 700; }
 .markdown-content p { margin-bottom: 1em; }
 
-/* Agent workspace */
+/* Agent 工作区 */
 .agent-composer { display: flex; flex-direction: column; gap: 18px; }
 .agent-caption { color: var(--text-sub); line-height: 1.7; }
 .agent-composer textarea, .follow-up-box textarea {
