@@ -47,6 +47,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       ROCKETMQ_NAMESERVER: rmqnamesrv:9876
       ROCKETMQ_TOPIC: video-analysis-topic
+      BILIBILI_IMPORT_ENABLED: "true"
+      BILIBILI_MAX_DURATION_SECONDS: "600"
+      BILIBILI_MAX_FILE_BYTES: "536870912"
+      BILIBILI_IMPORT_ATTEMPTS: "3"
       JWT_SECRET: change-this-before-deploying
       AUTO_CREATE_SCHEMA: "false"
       UPLOAD_ROOT: /data/uploads

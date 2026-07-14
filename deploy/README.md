@@ -33,6 +33,7 @@ openssl rand -hex 32
 - `CORS_ALLOWED_ORIGINS` 改成 `https://你的域名`。
 - 填写 `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL`；没有模型密钥时可以留空，使用 Mock Provider。
 - `OCR_ENABLED` 默认关闭。2 核服务器建议先关闭，避免 OCR 和视频分析同时占满 CPU。
+- `BILIBILI_IMPORT_ENABLED=true` 时允许通过 BV 号导入公开单视频；默认限制 10 分钟、512 MB、最多重试 3 次。
 
 大陆服务器访问官方依赖源不稳定时，可以只在生产环境文件中覆盖构建镜像源：
 
@@ -79,7 +80,7 @@ chmod +x deploy/smoke-production.sh
 ./deploy/smoke-production.sh
 ```
 
-冒烟默认使用 Mock Provider，结果只能证明业务与消息链路可用，不能代表真实模型准确率或线上并发能力。脚本不会输出生产密码，成功结束后会删除测试媒体、任务和账号。
+冒烟默认使用 Mock Provider，结果只能证明业务与消息链路可用，不能代表真实模型准确率或线上并发能力。脚本不会访问 B 站，避免把外部平台波动作为发布门禁；也不会输出生产密码，成功结束后会删除测试媒体、任务和账号。
 
 ## 4. 更新版本
 
@@ -106,6 +107,7 @@ chmod +x deploy/backup-mysql.sh
 
 - API 只运行 1 个 Uvicorn 进程。
 - Worker 消费线程数设置为 1，任务串行处理。
+- 2 核服务器保持 `WORKER_CPU_LIMIT=1.0`；4 核 8 GB 服务器可设置为 `2.0`，让单个 FFmpeg/导入任务使用更多 CPU，但仍建议保持单线程消费。
 - MySQL buffer pool 为 256 MB，Redis 上限为 192 MB。
 - RocketMQ NameServer/Broker 已限制 JVM 堆内存。
 - 单个视频默认不超过 512 MB、时长不超过 10 分钟。
@@ -128,4 +130,4 @@ d8a97b5aed30559a6bffe846835f0de39c6cb3f051b9ef665e461e1111ddd785
 
 将校验通过的文件改名为 `rocketmq-client.deb` 并放入 `backend/vendor/` 后重新构建。该文件已被 `.gitignore` 排除；Dockerfile 构建时还会再次校验哈希，目录中没有缓存时则自动从官方 Release 下载。
 
-生产演示只使用你自己的测试视频和模型密钥，不要在公开环境中保存隐私视频或长期保留第三方内容。
+生产演示只使用你自己的测试视频和模型密钥。BV 导入仅用于公开且用户有权处理的内容，不接收登录 Cookie，不处理付费、私密或受访问控制的视频，也不要长期保留第三方内容。

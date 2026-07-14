@@ -1,8 +1,8 @@
 # SeeIt AI 后端
 
-本目录是 SeeIt AI 的 Python/FastAPI 后端，负责用户认证、视频上传、异步分析任务和证据报告生成。核心流程如下：
+本目录是 SeeIt AI 的 Python/FastAPI 后端，负责用户认证、本地视频上传、BV 号导入、异步分析任务和证据报告生成。核心流程如下：
 
-`视频上传 -> MySQL/SQLite 持久化 -> 后台任务 -> FFmpeg/ASR -> 证据报告 -> 前端轮询`
+`本地上传/BV 导入 -> MySQL/SQLite 持久化 -> RocketMQ Worker -> FFmpeg/ASR -> 证据报告 -> 前端轮询`
 
 ## 本地启动
 
@@ -36,6 +36,7 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 
 - 使用 FastAPI 提供 REST API，通过 JWT 完成登录认证和用户资源归属校验。
 - 支持视频分片上传、缺失分片查询、原子合并、MD5 内容指纹和用户级内容去重。
+- 使用 `yt-dlp` 从经过格式校验的 BV 号读取公开视频元数据，并通过持久化导入任务和 RocketMQ Worker 异步下载；不接受任意 URL、登录 Cookie、付费或私密内容。
 - 使用 SQLAlchemy + Alembic 管理 MySQL/SQLite 中的用户、视频、上传会话、证据片段和分析任务。
 - 持久化分析任务状态，并通过 RocketMQ Producer/Consumer 解耦 API 与后台 Worker；重复消息通过原子抢占避免重复执行。
 - 使用 Redis `SET NX EX` 和数据库唯一约束限制相同视频和分析目标重复提交。
@@ -48,7 +49,7 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 
 ## 当前验证边界
 
-项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。OCR 依赖容器中的 Tesseract，RocketMQ 需要 Linux/Docker 动态库；对外描述时应以代码和测试能够验证的能力为准。
+项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。OCR 依赖容器中的 Tesseract，RocketMQ 需要 Linux/Docker 动态库；B 站导入依赖对方公开页面与格式，平台策略变化时可能需要升级 `yt-dlp`。对外描述时应以代码和测试能够验证的能力为准。
 
 服务器部署使用根目录的 `docker-compose.prod.yml`，详细步骤见 [`deploy/README.md`](../deploy/README.md)。
 

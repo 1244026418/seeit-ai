@@ -20,7 +20,7 @@
           </button>
 
           <div v-else class="user-profile">
-            <span class="user-name">:: {{ currentUser.nickname }} ::</span>
+            <span class="user-name">{{ currentUser.nickname }}</span>
             <button class="logout-btn" @click="logout" title="退出登录">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
             </button>
@@ -39,8 +39,30 @@
         <h1 class="slogan-main">SeeIt AI</h1>
         <p class="slogan-sub">视频内容工作台</p>
 
+        <div class="source-switch" role="tablist" aria-label="视频来源">
+          <button
+              class="source-switch-btn"
+              :class="{ active: sourceMode === 'local' }"
+              role="tab"
+              :aria-selected="sourceMode === 'local'"
+              @click="sourceMode = 'local'"
+          >
+            本地文件
+          </button>
+          <button
+              class="source-switch-btn"
+              :class="{ active: sourceMode === 'bilibili' }"
+              role="tab"
+              :aria-selected="sourceMode === 'bilibili'"
+              @click="sourceMode = 'bilibili'"
+          >
+            BV 号导入
+          </button>
+        </div>
+
         <div class="upload-wrapper">
           <input
+              v-if="sourceMode === 'local'"
               type="file"
               id="file-input"
               @change="handleFileChange"
@@ -49,6 +71,7 @@
           />
 
           <div
+              v-if="sourceMode === 'local'"
               class="upload-magnet"
               :class="{ 'processing': uploading, 'is-dragover': isDragOver }"
               @dragover.prevent="isDragOver = true"
@@ -75,6 +98,57 @@
 
             <div class="border-glow"></div>
           </div>
+
+          <div v-else class="bilibili-import-panel">
+            <div class="bilibili-form-row">
+              <div class="bilibili-input-wrap">
+                <label for="bvid-input">Bilibili BV 号</label>
+                <input
+                    id="bvid-input"
+                    v-model.trim="bvidInput"
+                    maxlength="200"
+                    placeholder="BV1xx411c7mD"
+                    :disabled="biliPreviewing || biliImporting"
+                    @keyup.enter="previewBilibili"
+                />
+              </div>
+              <button
+                  class="bilibili-preview-btn"
+                  :disabled="biliPreviewing || biliImporting || !bvidInput"
+                  @click="previewBilibili"
+              >
+                {{ biliPreviewing ? '解析中' : '解析视频' }}
+              </button>
+            </div>
+
+            <div v-if="biliPreview" class="bilibili-preview">
+              <img v-if="biliPreview.coverUrl" :src="biliPreview.coverUrl" alt="视频封面" referrerpolicy="no-referrer" />
+              <div class="bilibili-preview-copy">
+                <span class="source-kicker">{{ biliPreview.bvid }}</span>
+                <h2>{{ biliPreview.title }}</h2>
+                <div class="preview-meta">
+                  <span>{{ biliPreview.uploader || '未知作者' }}</span>
+                  <span>{{ formatDuration(biliPreview.durationSeconds) }}</span>
+                </div>
+              </div>
+              <button class="bilibili-import-btn" :disabled="biliImporting" @click="importBilibili">
+                {{ biliImporting ? '正在提交' : '导入媒体库' }}
+              </button>
+            </div>
+
+            <div v-if="biliTask" class="bilibili-task-status" :class="biliTask.state.toLowerCase()">
+              <div class="task-status-main">
+                <span class="status-dot"></span>
+                <div>
+                  <strong>{{ biliTask.title || biliTask.bvid }}</strong>
+                  <p>{{ biliTask.message }}</p>
+                </div>
+              </div>
+              <span class="task-state-label">{{ importStateLabel(biliTask.state) }}</span>
+            </div>
+
+            <p class="source-boundary">仅导入公开且你有权处理的视频，单条最长 10 分钟。</p>
+          </div>
         </div>
         <transition name="toast-pop">
           <div v-if="message" class="notification-bar" :class="{ 'error': message.startsWith('❌') || message.startsWith('⚠️') }">
@@ -95,13 +169,15 @@
               </svg>
             </button>
             <div class="card-meta">
-              <div class="meta-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+              <div class="meta-icon" :class="{ 'has-cover': item.coverUrl }">
+                <img v-if="item.coverUrl" :src="item.coverUrl" alt="视频封面" referrerpolicy="no-referrer" />
+                <svg v-else width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
               </div>
               <div class="meta-info">
                 <div class="filename-mask" :title="item.filename">{{ item.filename }}</div>
                 <div class="meta-tags">
                   <span class="time-tag">{{ formatTime(item.uploadTime) }}</span>
+                  <span v-if="item.sourceType === 'BILIBILI'" class="source-tag">{{ item.sourceRef }}</span>
                   <span class="status-indicator" :class="item.status.toLowerCase()">
                     {{ item.status === 'COMPLETED' ? '已完成' : item.status === 'FAILED' ? '失败' : '处理中' }}
                   </span>
@@ -265,6 +341,13 @@ const DEMO_MODE = new URLSearchParams(window.location.search).has('demo')
 const DEFAULT_GOAL = '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议'
 const goalPresets = ['生成学习笔记', '提炼会议结论', '梳理操作步骤']
 const file = ref(null)
+const sourceMode = ref('local')
+const bvidInput = ref('')
+const biliPreview = ref(null)
+const biliPreviewing = ref(false)
+const biliImporting = ref(false)
+const biliTask = ref(null)
+const biliPollTimer = ref(null)
 const message = ref('')
 const uploading = ref(false)
 const list = ref([])
@@ -458,6 +541,158 @@ const uploadFile = async () => {
     showMsg('❌ 上传失败: ' + error.message, true)
   } finally {
     uploading.value = false
+  }
+}
+
+const responseError = async (response, fallback) => {
+  const text = await response.text()
+  if (!text) return fallback
+  try {
+    const data = JSON.parse(text)
+    return data.detail || data.message || fallback
+  } catch (_) {
+    return text
+  }
+}
+
+const formatDuration = (seconds) => {
+  const value = Math.max(0, Number(seconds) || 0)
+  const minutes = Math.floor(value / 60)
+  return `${minutes}:${String(Math.floor(value % 60)).padStart(2, '0')}`
+}
+
+const importStateLabel = (state) => ({
+  QUEUED: '排队中',
+  PROCESSING: '下载中',
+  RETRYING: '重试中',
+  COMPLETED: '已完成',
+  FAILED: '失败'
+}[state] || state)
+
+const stopBiliPolling = () => {
+  if (biliPollTimer.value) clearTimeout(biliPollTimer.value)
+  biliPollTimer.value = null
+}
+
+const pollBilibiliImport = async (taskId, startedAt = Date.now()) => {
+  stopBiliPolling()
+  try {
+    const response = await apiRequest(`/media/bilibili/import-status?taskId=${encodeURIComponent(taskId)}`)
+    if (!response.ok) throw new Error(await responseError(response, '导入状态查询失败'))
+    const task = await response.json()
+    biliTask.value = task
+    if (task.state === 'COMPLETED') {
+      showMsg('✅ BV 视频已导入媒体库')
+      await fetchList()
+      return
+    }
+    if (task.state === 'FAILED') {
+      showMsg(`❌ ${task.message}`, true)
+      return
+    }
+    if (Date.now() - startedAt > 15 * 60 * 1000) {
+      showMsg('⚠️ 导入仍在后台执行，可稍后重新登录查看', true)
+      return
+    }
+    biliPollTimer.value = setTimeout(() => pollBilibiliImport(taskId, startedAt), 1500)
+  } catch (error) {
+    console.error(error)
+    showMsg(`❌ ${error.message}`, true)
+  }
+}
+
+const previewBilibili = async () => {
+  if (!currentUser.value) {
+    showMsg('⚠️ 请先登录后解析 BV 视频', true)
+    openAuthModal()
+    return
+  }
+  if (!bvidInput.value) return
+  if (DEMO_MODE) {
+    biliPreview.value = {
+      bvid: 'BV1xx411c7mD',
+      title: '数据结构课程 · 二叉树遍历',
+      uploader: '公开课演示账号',
+      durationSeconds: 542,
+      coverUrl: ''
+    }
+    return
+  }
+  biliPreviewing.value = true
+  biliPreview.value = null
+  try {
+    const response = await apiRequest('/media/bilibili/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bvid: bvidInput.value })
+    })
+    if (!response.ok) throw new Error(await responseError(response, 'BV 视频解析失败'))
+    biliPreview.value = await response.json()
+    bvidInput.value = biliPreview.value.bvid
+  } catch (error) {
+    showMsg(`❌ ${error.message}`, true)
+  } finally {
+    biliPreviewing.value = false
+  }
+}
+
+const importBilibili = async () => {
+  if (!biliPreview.value || biliImporting.value) return
+  if (DEMO_MODE) {
+    biliTask.value = {
+      taskId: 'demo-import',
+      bvid: biliPreview.value.bvid,
+      title: biliPreview.value.title,
+      state: 'COMPLETED',
+      message: '导入完成'
+    }
+    showMsg('演示模式：BV 视频已加入媒体库')
+    return
+  }
+  biliImporting.value = true
+  try {
+    const response = await apiRequest('/media/bilibili/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bvid: biliPreview.value.bvid })
+    })
+    const data = await response.json()
+    if (response.status === 200 && data.mediaId) {
+      showMsg('该 BV 视频已在媒体库中')
+      await fetchList()
+      return
+    }
+    if (![202, 409].includes(response.status)) {
+      throw new Error(data.detail || data.message || '创建导入任务失败')
+    }
+    biliTask.value = {
+      ...data,
+      title: biliPreview.value.title,
+      state: data.state || 'QUEUED'
+    }
+    await pollBilibiliImport(data.taskId)
+  } catch (error) {
+    showMsg(`❌ ${error.message}`, true)
+  } finally {
+    biliImporting.value = false
+  }
+}
+
+const restoreBilibiliImport = async () => {
+  if (!currentUser.value || DEMO_MODE) return
+  try {
+    const response = await apiRequest('/media/bilibili/imports')
+    if (!response.ok) return
+    const tasks = await response.json()
+    const active = tasks.find(task => ['QUEUED', 'PROCESSING', 'RETRYING'].includes(task.state))
+    if (active) {
+      sourceMode.value = 'bilibili'
+      biliTask.value = active
+      bvidInput.value = active.bvid
+      await pollBilibiliImport(active.taskId)
+    }
+  } catch (error) {
+    console.warn('BV 导入任务恢复失败', error)
   }
 }
 
@@ -830,6 +1065,7 @@ const handleAuth = async () => {
         closeAuthModal()
         showMsg(`欢迎回来，${data.userInfo.nickname}`)
         fetchList()
+        restoreBilibiliImport()
       } else {
         authMessage.value = '注册成功，请直接登录'
         authError.value = false
@@ -852,15 +1088,19 @@ const logout = () => {
     apiRequest('/user/logout', { method: 'POST' }).catch(() => {})
   }
   stopAllPolling()
+  stopBiliPolling()
   currentUser.value = null
   localStorage.removeItem('user')
   clearAuthToken()
   list.value = []
+  biliPreview.value = null
+  biliTask.value = null
   showMsg('已退出系统')
 }
 
 const handleAuthExpired = () => {
   stopAllPolling()
+  stopBiliPolling()
   currentUser.value = null
   list.value = []
   sidebar.value.visible = false
@@ -885,17 +1125,17 @@ onMounted(() => {
     } catch(e) {}
   }
   fetchList()
+  restoreBilibiliImport()
 })
 onUnmounted(() => {
   window.removeEventListener('auth-expired', handleAuthExpired)
   stopAllPolling()
+  stopBiliPolling()
 })
 </script>
 
 <style>
 /* 确保字体引用在最上方 */
-@import url('https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@300;500;700&family=Syncopate:wght@700&display=swap');
-
 :root {
   --bg-deep: #0b0c10;
   --bg-card: #121418;
@@ -1187,8 +1427,6 @@ html, body, #app {
 </style>
 
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
-
 :root {
   --bg-deep: #f3f5f7;
   --bg-card: #ffffff;
@@ -1208,7 +1446,7 @@ html, body, #app {
 
 .app-stage {
   color: var(--text-main) !important;
-  font-family: 'Inter', 'Noto Sans SC', sans-serif !important;
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif !important;
 }
 
 .app-stage .ambient-noise,
@@ -1618,6 +1856,229 @@ html, body, #app {
   overflow: hidden;
 }
 
+.app-stage .source-switch {
+  width: min(360px, 100%);
+  height: 42px;
+  margin: 0 auto 16px;
+  padding: 3px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--border-tech);
+  border-radius: 6px;
+  background: #e9edf0;
+}
+
+.app-stage .source-switch-btn {
+  min-width: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #68747f;
+  font-size: 0.86rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.app-stage .source-switch-btn.active {
+  background: #ffffff;
+  color: #172129;
+  box-shadow: 0 1px 4px rgba(23, 33, 41, 0.12);
+}
+
+.app-stage .bilibili-import-panel {
+  min-height: 360px;
+  padding: 34px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 22px;
+  border: 1px solid var(--border-tech);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 8px 26px rgba(23, 33, 41, 0.06);
+  text-align: left;
+}
+
+.app-stage .bilibili-form-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.app-stage .bilibili-input-wrap label {
+  display: block;
+  margin-bottom: 8px;
+  color: #34414a;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.app-stage .bilibili-input-wrap input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 48px;
+  padding: 0 14px;
+  border: 1px solid #cbd4da;
+  border-radius: 6px;
+  background: #f8fafb;
+  color: #172129;
+  font-family: 'Inter', sans-serif;
+}
+
+.app-stage .bilibili-input-wrap input:focus {
+  border-color: var(--accent-lime);
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(20, 125, 100, 0.12);
+}
+
+.app-stage .bilibili-preview-btn,
+.app-stage .bilibili-import-btn {
+  height: 48px;
+  padding: 0 22px;
+  border: 0;
+  border-radius: 6px;
+  background: #172129;
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.app-stage .bilibili-import-btn {
+  background: #e45f4f;
+  white-space: nowrap;
+}
+
+.app-stage .bilibili-preview-btn:disabled,
+.app-stage .bilibili-import-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.app-stage .bilibili-preview {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-tech);
+}
+
+.app-stage .bilibili-preview img {
+  width: 180px;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #edf1f3;
+}
+
+.app-stage .bilibili-preview-copy { min-width: 0; }
+
+.app-stage .source-kicker {
+  display: block;
+  margin-bottom: 5px;
+  color: #d14f43;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.app-stage .bilibili-preview-copy h2 {
+  margin: 0 0 10px;
+  overflow: hidden;
+  color: #172129;
+  font-size: 1.05rem;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-stage .preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  color: #68747f;
+  font-size: 0.8rem;
+}
+
+.app-stage .bilibili-task-status {
+  min-height: 66px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid #cfe0da;
+  border-radius: 6px;
+  background: #f4faf7;
+}
+
+.app-stage .task-status-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-stage .task-status-main .status-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent-lime);
+}
+
+.app-stage .task-status-main strong {
+  display: block;
+  overflow: hidden;
+  color: #172129;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-stage .task-status-main p {
+  margin: 4px 0 0;
+  color: #68747f;
+  font-size: 0.78rem;
+}
+
+.app-stage .task-state-label,
+.app-stage .source-tag {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: #eaf5f1;
+  color: #0c604c;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.app-stage .bilibili-task-status.failed {
+  border-color: #efb4ac;
+  background: #fff4f2;
+}
+
+.app-stage .bilibili-task-status.failed .status-dot { background: #d14f43; }
+.app-stage .bilibili-task-status.failed .task-state-label { background: #ffe4df; color: #8b2f27; }
+
+.app-stage .source-boundary {
+  margin: 0;
+  color: #7b8790;
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.app-stage .meta-icon.has-cover {
+  overflow: hidden;
+  background: #edf1f3 !important;
+}
+
+.app-stage .meta-icon.has-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 @media (max-width: 760px) {
   .app-stage .nav-content { padding: 0 16px !important; }
   .app-stage .main-container { padding: 24px 16px 48px !important; }
@@ -1628,5 +2089,13 @@ html, body, #app {
   .app-stage .card-grid { grid-template-columns: 1fr !important; }
   .app-stage .action-dock { grid-template-columns: 1fr !important; }
   .app-stage .sidebar-panel { width: 100% !important; }
+  .app-stage .bilibili-import-panel { min-height: 390px; padding: 22px 18px; }
+  .app-stage .bilibili-form-row { grid-template-columns: 1fr; }
+  .app-stage .bilibili-preview-btn { width: 100%; }
+  .app-stage .bilibili-preview { grid-template-columns: 1fr; }
+  .app-stage .bilibili-preview img { width: 100%; }
+  .app-stage .bilibili-preview-copy h2 { white-space: normal; }
+  .app-stage .bilibili-import-btn { width: 100%; }
+  .app-stage .bilibili-task-status { align-items: flex-start; flex-direction: column; }
 }
 </style>

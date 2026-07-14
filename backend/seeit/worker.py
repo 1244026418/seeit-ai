@@ -9,7 +9,7 @@ import threading
 from dotenv import load_dotenv
 from rocketmq.client import ConsumeStatus, PushConsumer
 
-from seeit.main import process_analysis
+from seeit.main import process_analysis, process_bilibili_import
 
 load_dotenv()
 log = logging.getLogger("seeit.worker")
@@ -28,7 +28,10 @@ def main() -> None:
     def handle(message):
         try:
             payload = json.loads(message.body.decode("utf-8"))
-            outcome = process_analysis(payload["taskId"])
+            if payload.get("type") == "bilibili_import":
+                outcome = process_bilibili_import(payload["taskId"])
+            else:
+                outcome = process_analysis(payload["taskId"])
             if outcome == "RETRYING":
                 return ConsumeStatus.RECONSUME_LATER
             return ConsumeStatus.CONSUME_SUCCESS

@@ -6,6 +6,7 @@
 
 - JWT 登录与用户资源隔离
 - 大文件分片上传、断点查询与 MD5 内容指纹
+- BV 号元数据预览、公开 B 站视频异步导入与来源追踪
 - 分片原子写入、用户级内容去重和上传异常恢复
 - MySQL 持久化与 Redis 重复任务锁
 - RocketMQ 异步分析任务与独立 Worker
@@ -20,13 +21,13 @@
 Vue 3 前端
     |
 FastAPI API 服务
-    |-- MySQL：用户 / 视频 / 上传会话 / 分析任务
+    |-- MySQL：用户 / 视频 / 上传会话 / 导入任务 / 分析任务
     |-- Redis：活跃任务锁
     |-- RocketMQ：分析任务消息
     |-- 共享媒体存储
     |
 RocketMQ Worker
-    |-- FFmpeg / ASR
+    |-- yt-dlp 公开视频导入 / FFmpeg / ASR
     |-- AI Provider
     `-- 结构化证据报告
 ```
@@ -77,7 +78,7 @@ cd backend
 pytest -q
 ```
 
-当前 10 项测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、失败重试、证据评估、反馈持久化、JWT 撤销、生产配置校验、FFprobe 视频校验和 RocketMQ 客户端契约。
+当前 12 项测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、失败重试、证据评估、反馈持久化、JWT 撤销、生产配置校验、FFprobe 视频校验、RocketMQ 客户端契约，以及 BV 校验、预览时长限制、导入幂等和媒体来源入库。
 
 ## 服务器部署
 
@@ -92,7 +93,7 @@ docker compose --env-file deploy/.env.production -f docker-compose.prod.yml up -
 
 详细的域名解析、安全组、首次启动、更新、备份和排错步骤见 [deploy/README.md](./deploy/README.md)。
 
-生产模式会强制检查 MySQL、Alembic、CORS 和 JWT 密钥配置；上传完成后使用 FFprobe 校验真实视频轨道与时长，并对登录、上传和分析接口执行限流。
+生产模式会强制检查 MySQL、Alembic、CORS 和 JWT 密钥配置；上传或 BV 导入完成后使用 FFprobe 校验真实视频轨道与时长，并对登录、上传、导入和分析接口执行限流。BV 导入只接受固定格式的 BV 号并构造 Bilibili 官方视频地址，不接受任意 URL。
 
 ## 项目结构
 

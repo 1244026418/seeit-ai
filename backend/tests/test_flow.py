@@ -21,6 +21,7 @@ os.environ["ROCKETMQ_NAMESERVER"] = ""
 os.environ["REDIS_URL"] = "redis://127.0.0.1:6399/15"
 
 import seeit.main as main
+from seeit.bilibili import DownloadedVideo
 
 
 def register(client: TestClient, suffix: str | None = None) -> dict:
@@ -60,6 +61,8 @@ def reset_database() -> None:
     main.Base.metadata.create_all(main.engine)
     shutil.rmtree(main.UPLOAD_ROOT, ignore_errors=True)
     main.UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    with main._rate_limit_lock:
+        main._local_rate_limits.clear()
 
 
 def test_register_upload_analyze_evaluate_and_feedback() -> None:
@@ -284,3 +287,101 @@ def test_ffprobe_video_validation_and_duration_limit(monkeypatch: pytest.MonkeyP
     })
     with pytest.raises(ValueError, match="视频时长不能超过"):
         main.validate_video_file(Path("too-long.mp4"))
+
+
+def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert main.normalize_bvid("https://www.bilibili.com/video/BV1xx411c7mD?p=1") == "BV1xx411c7mD"
+    with pytest.raises(ValueError, match="BV"):
+        main.normalize_bvid("https://example.com/video/123")
+
+    metadata = {
+        "bvid": "BV1xx411c7mD",
+        "title": "公开课程视频",
+        "uploader": "测试作者",
+        "durationSeconds": 120,
+        "coverUrl": "https://i0.hdslb.com/demo.jpg",
+        "webpageUrl": "https://www.bilibili.com/video/BV1xx411c7mD",
+    }
+    monkeypatch.setattr(main, "fetch_bilibili_metadata", lambda _: metadata)
+
+    with TestClient(main.app) as client:
+        headers = register(client, "bilipreview")
+        response = client.post("/media/bilibili/preview", json={"bvid": "BV1xx411c7mD"}, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["title"] == "公开课程视频"
+
+        monkeypatch.setattr(main, "fetch_bilibili_metadata", lambda _: {**metadata, "durationSeconds": 601})
+        response = client.post("/media/bilibili/preview", json={"bvid": "BV1xx411c7mD"}, headers=headers)
+        assert response.status_code == 400
+        assert "时长" in response.json()["detail"]
+
+
+def test_bilibili_import_is_idempotent_and_enters_media_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "publish_bilibili_import", lambda task_id: None)
+    monkeypatch.setattr(
+        main,
+        "validate_video_file",
+        lambda path: {"codec": "h264", "durationSeconds": 30.0, "width": 1280, "height": 720},
+    )
+
+    def fake_download(value: str, directory: Path) -> DownloadedVideo:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "BV1xx411c7mD.mp4"
+        path.write_bytes(b"downloaded-public-video")
+        return DownloadedVideo(
+            bvid="BV1xx411c7mD",
+            title="数据结构公开课",
+            uploader="测试作者",
+            duration_seconds=30,
+            cover_url="https://i0.hdslb.com/demo.jpg",
+            path=path,
+        )
+
+    monkeypatch.setattr(main, "download_bilibili_video", fake_download)
+
+    with TestClient(main.app) as client:
+        owner = register(client, "biliowner")
+        other = register(client, "biliother")
+        created = client.post(
+            "/media/bilibili/import",
+            json={"bvid": "BV1xx411c7mD"},
+            headers=owner,
+        )
+        assert created.status_code == 202
+        task_id = created.json()["taskId"]
+
+        duplicate = client.post(
+            "/media/bilibili/import",
+            json={"bvid": "BV1xx411c7mD"},
+            headers=owner,
+        )
+        assert duplicate.status_code == 409
+        assert duplicate.json()["taskId"] == task_id
+
+        assert main.process_bilibili_import(task_id) == "COMPLETED"
+        status = client.get(
+            "/media/bilibili/import-status",
+            params={"taskId": task_id},
+            headers=owner,
+        ).json()
+        assert status["state"] == "COMPLETED"
+        assert status["metadata"]["durationSeconds"] == 30
+        assert client.get(
+            "/media/bilibili/import-status",
+            params={"taskId": task_id},
+            headers=other,
+        ).status_code == 404
+
+        media = client.get("/media/list", headers=owner).json()
+        assert len(media) == 1
+        assert media[0]["sourceType"] == "BILIBILI"
+        assert media[0]["sourceRef"] == "BV1xx411c7mD"
+        assert media[0]["coverUrl"].endswith("demo.jpg")
+
+        existing = client.post(
+            "/media/bilibili/import",
+            json={"bvid": "BV1xx411c7mD"},
+            headers=owner,
+        )
+        assert existing.status_code == 200
+        assert existing.json()["mediaId"] == media[0]["id"]

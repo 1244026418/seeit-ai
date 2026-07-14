@@ -30,6 +30,13 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Te
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from seeit.bilibili import (
+    BilibiliImportError,
+    download_bilibili_video,
+    fetch_bilibili_metadata,
+    normalize_bvid,
+)
+
 load_dotenv()
 
 
@@ -42,6 +49,9 @@ UPLOAD_ROOT = Path(env("UPLOAD_ROOT", "./data/uploads")).resolve()
 MAX_CHUNK_BYTES = int(env("MAX_CHUNK_BYTES", str(5 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(env("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
 MAX_ANALYSIS_ATTEMPTS = int(env("MAX_ANALYSIS_ATTEMPTS", "3"))
+MAX_IMPORT_ATTEMPTS = int(env("BILIBILI_IMPORT_ATTEMPTS", "3"))
+BILIBILI_MAX_DURATION_SECONDS = int(env("BILIBILI_MAX_DURATION_SECONDS", "600"))
+BILIBILI_MAX_FILE_BYTES = int(env("BILIBILI_MAX_FILE_BYTES", str(512 * 1024 * 1024)))
 STALE_TASK_SECONDS = int(env("STALE_TASK_SECONDS", "1800"))
 UPLOAD_SESSION_TTL_HOURS = int(env("UPLOAD_SESSION_TTL_HOURS", "24"))
 OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "10")))
@@ -87,6 +97,9 @@ class Media(Base):
     file_path: Mapped[str] = mapped_column(String(1024))
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     status: Mapped[str] = mapped_column(String(20), default="COMPLETED")
+    source_type: Mapped[str] = mapped_column(String(20), default="UPLOAD")
+    source_ref: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    cover_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ai_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     upload_time: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -99,6 +112,29 @@ class UploadSession(Base):
     filename: Mapped[str] = mapped_column(String(255))
     total_chunks: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class MediaImportTask(Base):
+    __tablename__ = "media_import_tasks"
+    __table_args__ = (
+        UniqueConstraint("active_key", name="uq_media_import_tasks_active_key"),
+        Index("ix_import_task_state_updated", "state", "updated_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    media_id: Mapped[Optional[int]] = mapped_column(ForeignKey("media_files.id"), nullable=True, index=True)
+    bvid: Mapped[str] = mapped_column(String(12), index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="QUEUED")
+    active_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=MAX_IMPORT_ATTEMPTS)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class AnalysisTask(Base):
@@ -159,6 +195,10 @@ class AuthRequest(BaseModel):
 
 class AnalysisRequest(BaseModel):
     goal: str = Field(default="理解视频核心内容并生成结构化分析报告", max_length=500)
+
+
+class BilibiliRequest(BaseModel):
+    bvid: str = Field(min_length=3, max_length=200)
 
 
 class FeedbackRequest(BaseModel):
@@ -692,12 +732,11 @@ def run_analysis_locally(task_id: str) -> None:
         time.sleep(min(2 ** max(0, attempt - 1), 8))
 
 
-def publish_analysis(task_id: str) -> None:
-    """配置 RocketMQ 时投递消息，否则使用本地执行器处理任务。"""
+def publish_task_message(task_id: str, task_type: str, tag: str, local_runner: Any) -> None:
     global _rocketmq_producer
     nameserver = env("ROCKETMQ_NAMESERVER")
     if not nameserver:
-        executor.submit(run_analysis_locally, task_id)
+        executor.submit(local_runner, task_id)
         return
     try:
         from rocketmq.client import Message, Producer
@@ -710,12 +749,17 @@ def publish_analysis(task_id: str) -> None:
                 _rocketmq_producer = producer
         message = Message(env("ROCKETMQ_TOPIC", "video-analysis-topic"))
         message.set_keys(task_id)
-        message.set_tags("analysis")
-        message.set_body(json.dumps({"taskId": task_id}).encode("utf-8"))
+        message.set_tags(tag)
+        message.set_body(json.dumps({"type": task_type, "taskId": task_id}).encode("utf-8"))
         _rocketmq_producer.send_sync(message)
     except Exception:
-        log.exception("rocketmq_publish_failed task_id=%s; using local executor", task_id)
-        executor.submit(run_analysis_locally, task_id)
+        log.exception("rocketmq_publish_failed task_type=%s task_id=%s; using local executor", task_type, task_id)
+        executor.submit(local_runner, task_id)
+
+
+def publish_analysis(task_id: str) -> None:
+    """配置 RocketMQ 时投递消息，否则使用本地执行器处理任务。"""
+    publish_task_message(task_id, "analysis", "analysis", run_analysis_locally)
 
 
 def process_analysis(task_id: str) -> str:
@@ -806,6 +850,116 @@ def process_analysis(task_id: str) -> str:
             return task.state
 
 
+def run_bilibili_import_locally(task_id: str) -> None:
+    while True:
+        outcome = process_bilibili_import(task_id)
+        if outcome != "RETRYING":
+            return
+        with SessionLocal() as db:
+            task = db.get(MediaImportTask, task_id)
+            attempt = task.attempt_count if task else MAX_IMPORT_ATTEMPTS
+        time.sleep(min(2 ** max(0, attempt - 1), 8))
+
+
+def publish_bilibili_import(task_id: str) -> None:
+    publish_task_message(task_id, "bilibili_import", "bilibili-import", run_bilibili_import_locally)
+
+
+def process_bilibili_import(task_id: str) -> str:
+    temporary_dir = UPLOAD_ROOT / "tmp" / f"bilibili-{task_id}"
+    destination: Optional[Path] = None
+    with SessionLocal() as db:
+        now = datetime.now(timezone.utc)
+        claimed = db.execute(
+            update(MediaImportTask)
+            .where(MediaImportTask.id == task_id, MediaImportTask.state.in_(["QUEUED", "RETRYING"]))
+            .values(
+                state="PROCESSING",
+                attempt_count=MediaImportTask.attempt_count + 1,
+                started_at=now,
+                updated_at=now,
+                error=None,
+            )
+        )
+        db.commit()
+        if claimed.rowcount != 1:
+            return "SKIPPED"
+        task = db.get(MediaImportTask, task_id)
+        if not task:
+            return "SKIPPED"
+        user_id, bvid = task.user_id, task.bvid
+
+    try:
+        downloaded = download_bilibili_video(bvid, temporary_dir)
+        if downloaded.duration_seconds > BILIBILI_MAX_DURATION_SECONDS:
+            raise BilibiliImportError(f"视频时长不能超过 {BILIBILI_MAX_DURATION_SECONDS // 60} 分钟")
+        if downloaded.path.stat().st_size > BILIBILI_MAX_FILE_BYTES:
+            raise BilibiliImportError(f"视频文件不能超过 {BILIBILI_MAX_FILE_BYTES // (1024 * 1024)} MB")
+        probe = validate_video_file(downloaded.path)
+        content_hash = md5_file(downloaded.path)
+        metadata = {
+            "bvid": downloaded.bvid,
+            "title": downloaded.title,
+            "uploader": downloaded.uploader,
+            "durationSeconds": downloaded.duration_seconds or int(probe["durationSeconds"]),
+            "coverUrl": downloaded.cover_url,
+        }
+
+        with SessionLocal() as db:
+            task = db.get(MediaImportTask, task_id)
+            if not task or task.state != "PROCESSING":
+                return "SKIPPED"
+            media = db.scalar(select(Media).where(Media.user_id == user_id, Media.content_hash == content_hash))
+            if media:
+                downloaded.path.unlink(missing_ok=True)
+            else:
+                extension = downloaded.path.suffix.lower() or ".mp4"
+                filename = safe_filename(f"{downloaded.title}{extension}")
+                destination = media_dir() / f"{uuid.uuid4()}-{filename}"
+                downloaded.path.replace(destination)
+                media = Media(
+                    user_id=user_id,
+                    filename=filename,
+                    file_path=str(destination),
+                    content_hash=content_hash,
+                    source_type="BILIBILI",
+                    source_ref=downloaded.bvid,
+                    cover_url=downloaded.cover_url or None,
+                )
+                db.add(media)
+                db.flush()
+
+            task.media_id = media.id
+            task.title = downloaded.title
+            task.metadata_json = json.dumps(metadata, ensure_ascii=False)
+            task.state = "COMPLETED"
+            task.active_key = None
+            task.error = None
+            task.updated_at = datetime.now(timezone.utc)
+            task.finished_at = task.updated_at
+            db.commit()
+        return "COMPLETED"
+    except Exception as exc:
+        if destination:
+            destination.unlink(missing_ok=True)
+        with SessionLocal() as db:
+            task = db.get(MediaImportTask, task_id)
+            if not task:
+                return "FAILED"
+            should_retry = task.attempt_count < task.max_attempts
+            task.state = "RETRYING" if should_retry else "FAILED"
+            task.error = f"{exc.__class__.__name__}: {exc}"[:2000]
+            task.updated_at = datetime.now(timezone.utc)
+            if not should_retry:
+                task.active_key = None
+                task.finished_at = task.updated_at
+            db.commit()
+            log.exception("bilibili_import_failed task_id=%s attempt=%s", task.id, task.attempt_count)
+            return task.state
+    finally:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+
+
 def recover_stale_tasks() -> None:
     threshold = datetime.now(timezone.utc) - timedelta(seconds=STALE_TASK_SECONDS)
     with SessionLocal() as db:
@@ -824,6 +978,40 @@ def recover_stale_tasks() -> None:
         db.commit()
     for task_id in stale_ids:
         publish_analysis(task_id)
+
+
+def recover_stale_import_tasks() -> None:
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=STALE_TASK_SECONDS)
+    with SessionLocal() as db:
+        stale_ids = list(db.scalars(select(MediaImportTask.id).where(
+            MediaImportTask.state == "PROCESSING",
+            MediaImportTask.updated_at < threshold,
+            MediaImportTask.attempt_count < MediaImportTask.max_attempts,
+        )).all())
+        if stale_ids:
+            db.execute(
+                update(MediaImportTask)
+                .where(MediaImportTask.id.in_(stale_ids))
+                .values(state="RETRYING", error="服务重启后恢复未完成导入", updated_at=datetime.now(timezone.utc))
+            )
+        db.execute(
+            update(MediaImportTask)
+            .where(
+                MediaImportTask.state == "PROCESSING",
+                MediaImportTask.updated_at < threshold,
+                MediaImportTask.attempt_count >= MediaImportTask.max_attempts,
+            )
+            .values(
+                state="FAILED",
+                active_key=None,
+                error="导入任务超过最大重试次数",
+                updated_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+    for task_id in stale_ids:
+        publish_bilibili_import(task_id)
 
 
 def cleanup_stale_uploads() -> None:
@@ -863,12 +1051,13 @@ async def lifespan(_: FastAPI):
         Base.metadata.create_all(engine)
     cleanup_stale_uploads()
     recover_stale_tasks()
+    recover_stale_import_tasks()
     yield
 
 
 app = FastAPI(
     title="SeeIt AI API",
-    version="0.3.0",
+    version="0.4.0",
     root_path=env("ROOT_PATH", ""),
     lifespan=lifespan,
 )
@@ -927,6 +1116,134 @@ def logout(authorization: Optional[str] = Header(default=None), _: User = Depend
         except (jwt.InvalidTokenError, redis.RedisError):
             pass
     return {"code": 200, "message": "已退出登录"}
+
+
+def serialize_import_task(task: MediaImportTask) -> dict[str, Any]:
+    metadata = json.loads(task.metadata_json) if task.metadata_json else None
+    messages = {
+        "QUEUED": "等待导入",
+        "PROCESSING": "正在下载并校验视频",
+        "RETRYING": f"第 {task.attempt_count} 次导入失败，等待重试",
+        "COMPLETED": "导入完成",
+        "FAILED": task.error or "导入失败",
+    }
+    return {
+        "taskId": task.id,
+        "bvid": task.bvid,
+        "title": task.title,
+        "state": task.state,
+        "attemptCount": task.attempt_count,
+        "mediaId": task.media_id,
+        "metadata": metadata,
+        "message": messages.get(task.state, task.state),
+        "createdAt": task.created_at.isoformat(),
+        "updatedAt": task.updated_at.isoformat(),
+    }
+
+
+def ensure_bilibili_import_enabled() -> None:
+    if env("BILIBILI_IMPORT_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        raise HTTPException(status_code=503, detail="B 站视频导入当前未启用")
+
+
+@app.post("/media/bilibili/preview")
+def preview_bilibili(request: BilibiliRequest, user: User = Depends(current_user)) -> dict[str, Any]:
+    ensure_bilibili_import_enabled()
+    enforce_rate_limit(f"bilibili-preview:{user.id}", 30, 3600)
+    try:
+        metadata = fetch_bilibili_metadata(request.bvid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BilibiliImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if metadata["durationSeconds"] > BILIBILI_MAX_DURATION_SECONDS:
+        raise HTTPException(status_code=400, detail=f"视频时长不能超过 {BILIBILI_MAX_DURATION_SECONDS // 60} 分钟")
+    return metadata
+
+
+@app.post("/media/bilibili/import")
+def start_bilibili_import(request: BilibiliRequest, user: User = Depends(current_user)) -> JSONResponse:
+    ensure_bilibili_import_enabled()
+    enforce_rate_limit(f"bilibili-import:{user.id}", 10, 3600)
+    try:
+        bvid = normalize_bvid(request.bvid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    active_key = f"{user.id}:{bvid}"
+    task_id = str(uuid.uuid4())
+    with SessionLocal() as db:
+        existing_media = db.scalar(select(Media).where(
+            Media.user_id == user.id,
+            Media.source_type == "BILIBILI",
+            Media.source_ref == bvid,
+        ))
+        if existing_media:
+            return JSONResponse(
+                status_code=200,
+                content={"mediaId": existing_media.id, "message": "该 BV 视频已在媒体库中"},
+            )
+        completed = db.scalar(
+            select(MediaImportTask)
+            .where(
+                MediaImportTask.user_id == user.id,
+                MediaImportTask.bvid == bvid,
+                MediaImportTask.state == "COMPLETED",
+                MediaImportTask.media_id.is_not(None),
+            )
+            .order_by(MediaImportTask.created_at.desc())
+        )
+        if completed and db.get(Media, completed.media_id):
+            return JSONResponse(
+                status_code=200,
+                content={"mediaId": completed.media_id, "message": "该 BV 视频已在媒体库中"},
+            )
+        active = db.scalar(select(MediaImportTask).where(
+            MediaImportTask.user_id == user.id,
+            MediaImportTask.bvid == bvid,
+            MediaImportTask.state.in_(["QUEUED", "PROCESSING", "RETRYING"]),
+        ))
+        if active:
+            return JSONResponse(status_code=409, content=serialize_import_task(active))
+        task = MediaImportTask(
+            id=task_id,
+            user_id=user.id,
+            bvid=bvid,
+            active_key=active_key,
+            max_attempts=MAX_IMPORT_ATTEMPTS,
+        )
+        db.add(task)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            active = db.scalar(select(MediaImportTask).where(MediaImportTask.active_key == active_key))
+            if active:
+                return JSONResponse(status_code=409, content=serialize_import_task(active))
+            raise
+    publish_bilibili_import(task_id)
+    return JSONResponse(status_code=202, content={"taskId": task_id, "bvid": bvid, "message": "导入任务已提交"})
+
+
+@app.get("/media/bilibili/import-status")
+def bilibili_import_status(taskId: str, user: User = Depends(current_user)) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(MediaImportTask, taskId)
+        if not task or task.user_id != user.id:
+            raise HTTPException(status_code=404, detail="导入任务不存在")
+        return serialize_import_task(task)
+
+
+@app.get("/media/bilibili/imports")
+def bilibili_import_list(user: User = Depends(current_user)) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        tasks = db.scalars(
+            select(MediaImportTask)
+            .where(MediaImportTask.user_id == user.id)
+            .order_by(MediaImportTask.created_at.desc())
+            .limit(10)
+        ).all()
+        return [serialize_import_task(task) for task in tasks]
 
 
 @app.post("/media/init-upload")
@@ -1045,7 +1362,15 @@ def complete_upload(uploadId: str, user: User = Depends(current_user)) -> dict[s
 def media_list(user: User = Depends(current_user)) -> list[dict[str, Any]]:
     with SessionLocal() as db:
         rows = db.scalars(select(Media).where(Media.user_id == user.id).order_by(Media.id.desc())).all()
-        return [{"id": row.id, "filename": row.filename, "status": row.status, "uploadTime": row.upload_time.isoformat(), "coverUrl": None} for row in rows]
+        return [{
+            "id": row.id,
+            "filename": row.filename,
+            "status": row.status,
+            "uploadTime": row.upload_time.isoformat(),
+            "coverUrl": row.cover_url,
+            "sourceType": row.source_type,
+            "sourceRef": row.source_ref,
+        } for row in rows]
 
 
 @app.delete("/media/delete")
@@ -1057,6 +1382,7 @@ def delete_media(id: int, user: User = Depends(current_user)) -> str:
             db.execute(delete(AnalysisFeedback).where(AnalysisFeedback.task_id.in_(task_ids)))
         db.execute(delete(AnalysisTask).where(AnalysisTask.media_id == id))
         db.execute(delete(EvidenceSegment).where(EvidenceSegment.media_id == id))
+        db.execute(delete(MediaImportTask).where(MediaImportTask.media_id == id))
         Path(media.file_path).unlink(missing_ok=True)
         Path(media.file_path + ".txt").unlink(missing_ok=True)
         Path(media.file_path + ".segments.json").unlink(missing_ok=True)
