@@ -72,6 +72,15 @@ curl https://你的域名/api/health
 
 浏览器访问 `https://你的域名`。OpenAPI 文档地址为 `https://你的域名/api/docs`。
 
+启动完成后可以执行一次无密钥生产冒烟。脚本会在 API 容器内生成 2 秒测试视频，依次验证注册、登录、三分片断点查询、视频校验、RocketMQ 异步分析、Agent 轨迹/评估/反馈和资源清理，并在最后输出消费者偏移与积压：
+
+```bash
+chmod +x deploy/smoke-production.sh
+./deploy/smoke-production.sh
+```
+
+冒烟默认使用 Mock Provider，结果只能证明业务与消息链路可用，不能代表真实模型准确率或线上并发能力。脚本不会输出生产密码，成功结束后会删除测试媒体、任务和账号。
+
 ## 4. 更新版本
 
 ```bash
