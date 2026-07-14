@@ -705,7 +705,7 @@ def publish_analysis(task_id: str) -> None:
         with task_lock:
             if _rocketmq_producer is None:
                 producer = Producer(env("ROCKETMQ_PRODUCER_GROUP", "seeit-python-producer"))
-                producer.set_namesrv_addr(nameserver)
+                producer.set_name_server_address(nameserver)
                 producer.start()
                 _rocketmq_producer = producer
         message = Message(env("ROCKETMQ_TOPIC", "video-analysis-topic"))

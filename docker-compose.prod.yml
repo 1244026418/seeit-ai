@@ -52,6 +52,19 @@ services:
     cpus: 0.2
     logging: *default-logging
 
+  rmqinit:
+    image: apache/rocketmq:4.9.4
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 3000:3000 /namesrv-logs /broker-logs /store"]
+    restart: "no"
+    volumes:
+      - seeit_prod_rmq_namesrv_logs:/namesrv-logs
+      - seeit_prod_rmq_broker_logs:/broker-logs
+      - seeit_prod_rmq_store:/store
+    mem_limit: 64m
+    cpus: 0.1
+    logging: *default-logging
+
   rmqnamesrv:
     image: apache/rocketmq:4.9.4
     restart: unless-stopped
@@ -60,6 +73,9 @@ services:
       JAVA_OPT_EXT: "-Xms128m -Xmx256m -Xmn96m"
     volumes:
       - seeit_prod_rmq_namesrv_logs:/home/rocketmq/logs
+    depends_on:
+      rmqinit:
+        condition: service_completed_successfully
     mem_limit: 384m
     cpus: 0.25
     logging: *default-logging
@@ -72,6 +88,8 @@ services:
       NAMESRV_ADDR: rmqnamesrv:9876
       JAVA_OPT_EXT: "-Xms256m -Xmx768m -Xmn256m"
     depends_on:
+      rmqinit:
+        condition: service_completed_successfully
       rmqnamesrv:
         condition: service_started
     volumes:

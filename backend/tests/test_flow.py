@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -149,6 +151,52 @@ def test_duplicate_active_analysis_is_rejected(monkeypatch: pytest.MonkeyPatch) 
         assert first.status_code == 202
         assert second.status_code == 409
         assert second.json()["taskId"] == first.json()["taskId"]
+
+
+def test_rocketmq_producer_uses_supported_nameserver_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class FakeProducer:
+        def __init__(self, group: str) -> None:
+            calls.append(("group", group))
+
+        def set_name_server_address(self, address: str) -> None:
+            calls.append(("nameserver", address))
+
+        def start(self) -> None:
+            calls.append(("state", "started"))
+
+        def send_sync(self, message: object) -> None:
+            calls.append(("state", "sent"))
+
+    class FakeMessage:
+        def __init__(self, topic: str) -> None:
+            calls.append(("topic", topic))
+
+        def set_keys(self, value: str) -> None:
+            pass
+
+        def set_tags(self, value: str) -> None:
+            pass
+
+        def set_body(self, value: bytes) -> None:
+            pass
+
+    client_module = types.ModuleType("rocketmq.client")
+    client_module.Producer = FakeProducer
+    client_module.Message = FakeMessage
+    package_module = types.ModuleType("rocketmq")
+    package_module.client = client_module
+    monkeypatch.setitem(sys.modules, "rocketmq", package_module)
+    monkeypatch.setitem(sys.modules, "rocketmq.client", client_module)
+    monkeypatch.setenv("ROCKETMQ_NAMESERVER", "rmqnamesrv:9876")
+    monkeypatch.setattr(main, "_rocketmq_producer", None)
+
+    main.publish_analysis("task-contract")
+
+    assert ("nameserver", "rmqnamesrv:9876") in calls
+    assert ("state", "started") in calls
+    assert ("state", "sent") in calls
 
 
 def test_failed_analysis_retries_then_becomes_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
