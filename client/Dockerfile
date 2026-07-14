@@ -2,7 +2,8 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+ARG NPM_REGISTRY=https://registry.npmjs.org
+RUN npm ci --registry="$NPM_REGISTRY"
 
 COPY . .
 ARG VITE_API_BASE_URL=/api

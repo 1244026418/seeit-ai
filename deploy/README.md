@@ -27,11 +27,22 @@ openssl rand -hex 32
 编辑 `deploy/.env.production`：
 
 - 将 `DOMAIN` 改成你的真实域名。
+- 域名未备案或尚未解析时，可临时使用 `DOMAIN=http://服务器公网IP`，同时将 `CORS_ALLOWED_ORIGINS` 改成相同地址。
 - 为 `MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`REDIS_PASSWORD` 和 `JWT_SECRET` 生成不同的随机值。
 - `DATABASE_URL` 中的 MySQL 用户和密码必须与上面的变量一致。
 - `CORS_ALLOWED_ORIGINS` 改成 `https://你的域名`。
 - 填写 `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL`；没有模型密钥时可以留空，使用 Mock Provider。
 - `OCR_ENABLED` 默认关闭。2 核服务器建议先关闭，避免 OCR 和视频分析同时占满 CPU。
+
+大陆服务器访问官方依赖源不稳定时，可以只在生产环境文件中覆盖构建镜像源：
+
+```dotenv
+DEBIAN_MIRROR=mirrors.cloud.tencent.com
+PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+NPM_REGISTRY=https://registry.npmmirror.com
+```
+
+Dockerfile 的默认值仍是 Debian、PyPI 和 npm 官方源，因此这组配置不会影响其他地区的构建。
 
 生产环境文件包含密码，不能提交 GitHub：
 
@@ -47,7 +58,7 @@ docker compose --env-file deploy/.env.production -f docker-compose.prod.yml up -
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml ps
 ```
 
-API 容器启动时会自动执行 `alembic upgrade head`。查看迁移和 Worker 日志：
+API 容器启动时会自动执行 `alembic upgrade head`；数据库刚启动时，入口脚本会以 2 秒间隔进行最多 30 次有限重试。查看迁移和 Worker 日志：
 
 ```bash
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml logs -f api worker
@@ -99,5 +110,13 @@ docker compose --env-file deploy/.env.production -f docker-compose.prod.yml logs
 docker stats
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml restart worker
 ```
+
+如果服务器可以拉取 GitHub 页面但无法稳定下载 RocketMQ 客户端二进制，可在可信网络中从官方 Release 下载 `rocketmq-client-cpp-2.0.0.amd64.deb`，校验 SHA-256 为：
+
+```text
+d8a97b5aed30559a6bffe846835f0de39c6cb3f051b9ef665e461e1111ddd785
+```
+
+将校验通过的文件改名为 `rocketmq-client.deb` 并放入 `backend/vendor/` 后重新构建。该文件已被 `.gitignore` 排除；Dockerfile 构建时还会再次校验哈希，目录中没有缓存时则自动从官方 Release 下载。
 
 生产演示只使用你自己的测试视频和模型密钥，不要在公开环境中保存隐私视频或长期保留第三方内容。
