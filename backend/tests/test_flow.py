@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-TEST_ROOT = Path("F:/temp/codex-seeit-ai/test-flow")
+DEFAULT_TEST_ROOT = "F:/temp/codex-seeit-ai/test-flow" if os.name == "nt" else "/tmp/codex-seeit-ai/test-flow"
+TEST_ROOT = Path(os.environ.get("SEEIT_TEST_ROOT", DEFAULT_TEST_ROOT))
 TEST_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ["DATABASE_URL"] = f"sqlite:///{(TEST_ROOT / 'test.db').as_posix()}"
 os.environ["UPLOAD_ROOT"] = str(TEST_ROOT / "uploads")
@@ -184,3 +185,54 @@ def test_chunk_size_and_authentication_errors(monkeypatch: pytest.MonkeyPatch) -
         response = client.post("/media/upload-chunk", data={"uploadId": upload_id, "chunkIndex": "0", "totalChunks": "1"}, files={"file": ("large", b"12345")}, headers=headers)
         assert response.status_code == 413
         assert client.get("/media/list").status_code == 401
+
+
+def test_logout_revokes_token_when_redis_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+
+        def get(self, key: str) -> str | None:
+            return self.values.get(key)
+
+        def setex(self, key: str, ttl: int, value: str) -> None:
+            assert ttl > 0
+            self.values[key] = value
+
+    with TestClient(main.app) as client:
+        headers = register(client, "logout")
+        fake_redis = FakeRedis()
+        monkeypatch.setattr(main, "redis_client", lambda: fake_redis)
+        assert client.post("/user/logout", headers=headers).status_code == 200
+        assert client.get("/media/list", headers=headers).status_code == 401
+
+
+def test_production_mode_rejects_unsafe_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AUTO_CREATE_SCHEMA", "true")
+    monkeypatch.setattr(main, "JWT_SECRET", "short")
+    monkeypatch.setattr(main, "DATABASE_URL", "sqlite:///unsafe.db")
+    monkeypatch.setattr(main, "origins", ["*"])
+    with pytest.raises(RuntimeError, match="生产配置不安全"):
+        main.validate_production_config()
+
+
+def test_ffprobe_video_validation_and_duration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Completed:
+        stdout = json.dumps({
+            "streams": [{"codec_name": "h264", "width": 1920, "height": 1080}],
+            "format": {"duration": "120.5"},
+        })
+
+    monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Completed())
+    monkeypatch.setenv("MAX_VIDEO_DURATION_SECONDS", "600")
+    result = main.validate_video_file(Path("demo.mp4"))
+    assert result["codec"] == "h264"
+    assert result["durationSeconds"] == 120.5
+
+    Completed.stdout = json.dumps({
+        "streams": [{"codec_name": "h264", "width": 1920, "height": 1080}],
+        "format": {"duration": "601"},
+    })
+    with pytest.raises(ValueError, match="视频时长不能超过"):
+        main.validate_video_file(Path("too-long.mp4"))

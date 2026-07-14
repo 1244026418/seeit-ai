@@ -1,0 +1,220 @@
+name: seeit-ai-prod
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=50
+      - --performance-schema=OFF
+    volumes:
+      - seeit_prod_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 1280m
+    cpus: 0.6
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory 192mb --maxmemory-policy noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - seeit_prod_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+    cpus: 0.2
+    logging: *default-logging
+
+  rmqnamesrv:
+    image: apache/rocketmq:4.9.4
+    restart: unless-stopped
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms128m -Xmx256m -Xmn96m"
+    volumes:
+      - seeit_prod_rmq_namesrv_logs:/home/rocketmq/logs
+    mem_limit: 384m
+    cpus: 0.25
+    logging: *default-logging
+
+  rmqbroker:
+    image: apache/rocketmq:4.9.4
+    restart: unless-stopped
+    command: sh mqbroker -n rmqnamesrv:9876
+    environment:
+      NAMESRV_ADDR: rmqnamesrv:9876
+      JAVA_OPT_EXT: "-Xms256m -Xmx768m -Xmn256m"
+    depends_on:
+      rmqnamesrv:
+        condition: service_started
+    volumes:
+      - seeit_prod_rmq_store:/home/rocketmq/store
+      - seeit_prod_rmq_broker_logs:/home/rocketmq/logs
+    mem_limit: 1024m
+    cpus: 0.5
+    logging: *default-logging
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      ROCKETMQ_NAMESERVER: ${ROCKETMQ_NAMESERVER}
+      ROCKETMQ_TOPIC: ${ROCKETMQ_TOPIC}
+      ROCKETMQ_PRODUCER_GROUP: ${ROCKETMQ_PRODUCER_GROUP}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS}
+      APP_ENV: production
+      AUTO_CREATE_SCHEMA: "false"
+      ROOT_PATH: /api
+      UPLOAD_ROOT: /data/uploads
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      MAX_CHUNK_BYTES: ${MAX_CHUNK_BYTES}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES}
+      MAX_VIDEO_DURATION_SECONDS: ${MAX_VIDEO_DURATION_SECONDS}
+      VALIDATE_VIDEO_CONTENT: ${VALIDATE_VIDEO_CONTENT}
+      UPLOAD_SESSION_TTL_HOURS: ${UPLOAD_SESSION_TTL_HOURS}
+      MAX_ANALYSIS_ATTEMPTS: ${MAX_ANALYSIS_ATTEMPTS}
+      STALE_TASK_SECONDS: ${STALE_TASK_SECONDS}
+      AI_BASE_URL: ${AI_BASE_URL}
+      AI_API_KEY: ${AI_API_KEY}
+      AI_MODEL: ${AI_MODEL}
+      ASR_BASE_URL: ${ASR_BASE_URL}
+      ASR_API_KEY: ${ASR_API_KEY}
+      ASR_MODEL: ${ASR_MODEL}
+      OCR_ENABLED: ${OCR_ENABLED}
+      OCR_INTERVAL_SECONDS: ${OCR_INTERVAL_SECONDS}
+      OCR_LANG: ${OCR_LANG}
+      LOCAL_EXECUTOR_WORKERS: 1
+      LOG_LEVEL: ${LOG_LEVEL}
+    volumes:
+      - seeit_prod_uploads:/data/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rmqbroker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 768m
+    cpus: 0.5
+    logging: *default-logging
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: python -m seeit.worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      ROCKETMQ_NAMESERVER: ${ROCKETMQ_NAMESERVER}
+      ROCKETMQ_TOPIC: ${ROCKETMQ_TOPIC}
+      ROCKETMQ_CONSUMER_GROUP: ${ROCKETMQ_CONSUMER_GROUP}
+      JWT_SECRET: ${JWT_SECRET}
+      APP_ENV: production
+      AUTO_CREATE_SCHEMA: "false"
+      UPLOAD_ROOT: /data/uploads
+      MAX_ANALYSIS_ATTEMPTS: ${MAX_ANALYSIS_ATTEMPTS}
+      STALE_TASK_SECONDS: ${STALE_TASK_SECONDS}
+      AI_BASE_URL: ${AI_BASE_URL}
+      AI_API_KEY: ${AI_API_KEY}
+      AI_MODEL: ${AI_MODEL}
+      ASR_BASE_URL: ${ASR_BASE_URL}
+      ASR_API_KEY: ${ASR_API_KEY}
+      ASR_MODEL: ${ASR_MODEL}
+      OCR_ENABLED: ${OCR_ENABLED}
+      OCR_INTERVAL_SECONDS: ${OCR_INTERVAL_SECONDS}
+      OCR_LANG: ${OCR_LANG}
+      ROCKETMQ_CONSUME_THREADS: 1
+      LOG_LEVEL: ${LOG_LEVEL}
+    volumes:
+      - seeit_prod_uploads:/data/uploads
+    depends_on:
+      api:
+        condition: service_healthy
+      rmqbroker:
+        condition: service_started
+    mem_limit: 1024m
+    cpus: 1.0
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 192m
+    cpus: 0.2
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - seeit_prod_caddy_data:/data
+      - seeit_prod_caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_started
+    mem_limit: 192m
+    cpus: 0.2
+    logging: *default-logging
+
+volumes:
+  seeit_prod_mysql:
+  seeit_prod_redis:
+  seeit_prod_rmq_store:
+  seeit_prod_rmq_namesrv_logs:
+  seeit_prod_rmq_broker_logs:
+  seeit_prod_uploads:
+  seeit_prod_caddy_data:
+  seeit_prod_caddy_config:

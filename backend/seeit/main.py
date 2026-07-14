@@ -22,7 +22,7 @@ import httpx
 import jwt
 import redis
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -43,10 +43,17 @@ MAX_CHUNK_BYTES = int(env("MAX_CHUNK_BYTES", str(5 * 1024 * 1024)))
 MAX_UPLOAD_BYTES = int(env("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
 MAX_ANALYSIS_ATTEMPTS = int(env("MAX_ANALYSIS_ATTEMPTS", "3"))
 STALE_TASK_SECONDS = int(env("STALE_TASK_SECONDS", "1800"))
+UPLOAD_SESSION_TTL_HOURS = int(env("UPLOAD_SESSION_TTL_HOURS", "24"))
 OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "10")))
 JWT_SECRET = env("JWT_SECRET", "development-only-change-me")
 JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = int(env("JWT_EXPIRE_HOURS", "24"))
 log = logging.getLogger("seeit")
+
+logging.basicConfig(
+    level=getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args=connect_args)
@@ -244,17 +251,37 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def issue_token(user: User) -> str:
-    payload = {"sub": str(user.id), "role": user.role, "exp": datetime.now(timezone.utc) + timedelta(days=7)}
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(token: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if not payload.get("jti"):
+            raise jwt.InvalidTokenError("missing jti")
+        client = redis_client()
+        if client and client.get(f"jwt:revoked:{payload['jti']}"):
+            raise jwt.InvalidTokenError("revoked token")
+        return payload
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="登录已失效") from exc
 
 
 def current_user(authorization: Optional[str] = Header(default=None)) -> User:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     try:
-        payload = jwt.decode(authorization[7:], JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = decode_token(authorization[7:])
         user_id = int(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError, ValueError):
+    except (KeyError, ValueError):
         raise HTTPException(status_code=401, detail="登录已失效")
     with SessionLocal() as db:
         user = db.get(User, user_id)
@@ -291,6 +318,46 @@ def md5_file(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def validate_video_file(path: Path) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=60,
+    )
+    payload = json.loads(completed.stdout or "{}")
+    streams = payload.get("streams") or []
+    if not streams:
+        raise ValueError("文件中未检测到视频轨道")
+    duration = float((payload.get("format") or {}).get("duration") or 0)
+    max_duration = int(env("MAX_VIDEO_DURATION_SECONDS", "600"))
+    if duration <= 0:
+        raise ValueError("无法读取视频时长")
+    if duration > max_duration:
+        raise ValueError(f"视频时长不能超过 {max_duration // 60} 分钟")
+    stream = streams[0]
+    return {
+        "codec": stream.get("codec_name"),
+        "width": int(stream.get("width") or 0),
+        "height": int(stream.get("height") or 0),
+        "durationSeconds": round(duration, 3),
+    }
 
 
 def _milliseconds(value: Any, *, seconds: bool = False) -> int:
@@ -541,10 +608,15 @@ def format_report(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="analysis")
+executor = ThreadPoolExecutor(
+    max_workers=max(1, int(env("LOCAL_EXECUTOR_WORKERS", "2"))),
+    thread_name_prefix="analysis",
+)
 task_lock = threading.Lock()
 _redis_client: Optional[redis.Redis] = None
 _rocketmq_producer: Any = None
+_rate_limit_lock = threading.Lock()
+_local_rate_limits: dict[str, tuple[int, float]] = {}
 
 
 def redis_client() -> Optional[redis.Redis]:
@@ -563,6 +635,33 @@ def redis_client() -> Optional[redis.Redis]:
         return client
     except redis.RedisError:
         return None
+
+
+def enforce_rate_limit(key: str, limit: int, window_seconds: int) -> None:
+    """优先使用 Redis 计数；Redis 不可用时退化为单进程内存计数。"""
+    redis_key = f"rate:{key}"
+    client = redis_client()
+    if client:
+        try:
+            count = int(client.incr(redis_key))
+            if count == 1:
+                client.expire(redis_key, window_seconds)
+            if count > limit:
+                raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试", headers={"Retry-After": str(window_seconds)})
+            return
+        except redis.RedisError:
+            log.warning("redis_rate_limit_unavailable key=%s", key)
+
+    now = time.monotonic()
+    with _rate_limit_lock:
+        count, expires_at = _local_rate_limits.get(key, (0, now + window_seconds))
+        if now >= expires_at:
+            count, expires_at = 0, now + window_seconds
+        count += 1
+        _local_rate_limits[key] = (count, expires_at)
+        if count > limit:
+            retry_after = max(1, int(expires_at - now))
+            raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试", headers={"Retry-After": str(retry_after)})
 
 
 def active_task_key(media_id: int, goal: str) -> str:
@@ -727,16 +826,52 @@ def recover_stale_tasks() -> None:
         publish_analysis(task_id)
 
 
+def cleanup_stale_uploads() -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=UPLOAD_SESSION_TTL_HOURS)
+    with SessionLocal() as db:
+        sessions = db.scalars(select(UploadSession).where(UploadSession.created_at < cutoff)).all()
+        if not sessions:
+            return
+        for session in sessions:
+            shutil.rmtree(chunk_dir(session.id), ignore_errors=True)
+            db.delete(session)
+        db.commit()
+        log.info("stale_upload_sessions_cleaned count=%s", len(sessions))
+
+
+def validate_production_config() -> None:
+    if env("APP_ENV", "development").lower() != "production":
+        return
+    problems = []
+    if len(JWT_SECRET) < 32 or JWT_SECRET in {"development-only-change-me", "change-this-before-deploying"}:
+        problems.append("JWT_SECRET 必须是至少 32 位随机值")
+    if DATABASE_URL.startswith("sqlite"):
+        problems.append("生产环境不能使用 SQLite")
+    if env("AUTO_CREATE_SCHEMA", "true").lower() in {"1", "true", "yes"}:
+        problems.append("生产环境必须关闭 AUTO_CREATE_SCHEMA 并执行 Alembic")
+    if any(origin in {"*", "http://localhost:5173", "http://127.0.0.1:5173"} for origin in origins):
+        problems.append("生产 CORS_ALLOWED_ORIGINS 不能使用本地地址或通配符")
+    if problems:
+        raise RuntimeError("生产配置不安全：" + "；".join(problems))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_production_config()
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     if env("AUTO_CREATE_SCHEMA", "true").lower() in {"1", "true", "yes"}:
         Base.metadata.create_all(engine)
+    cleanup_stale_uploads()
     recover_stale_tasks()
     yield
 
 
-app = FastAPI(title="SeeIt AI API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(
+    title="SeeIt AI API",
+    version="0.3.0",
+    root_path=env("ROOT_PATH", ""),
+    lifespan=lifespan,
+)
 origins = [item.strip() for item in env("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -754,7 +889,8 @@ def health() -> dict[str, str]:
 
 
 @app.post("/user/register")
-def register(request: AuthRequest) -> JSONResponse:
+def register(request: AuthRequest, http_request: Request) -> JSONResponse:
+    enforce_rate_limit(f"register:{http_request.client.host if http_request.client else 'unknown'}", 10, 60)
     username = request.username.strip()
     if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", username) or not 8 <= len(request.password) <= 128:
         return JSONResponse(status_code=400, content={"code": 400, "message": "账号或密码格式不正确"})
@@ -769,7 +905,8 @@ def register(request: AuthRequest) -> JSONResponse:
 
 
 @app.post("/user/login")
-def login(request: AuthRequest) -> JSONResponse:
+def login(request: AuthRequest, http_request: Request) -> JSONResponse:
+    enforce_rate_limit(f"login:{http_request.client.host if http_request.client else 'unknown'}", 10, 60)
     with SessionLocal() as db:
         user = db.scalar(select(User).where(User.username == request.username.strip()))
         if not user or not verify_password(request.password, user.password_hash):
@@ -778,12 +915,23 @@ def login(request: AuthRequest) -> JSONResponse:
 
 
 @app.post("/user/logout")
-def logout(_: User = Depends(current_user)) -> dict[str, Any]:
+def logout(authorization: Optional[str] = Header(default=None), _: User = Depends(current_user)) -> dict[str, Any]:
+    if authorization and authorization.lower().startswith("bearer "):
+        try:
+            payload = jwt.decode(authorization[7:], JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            expires_at = int(payload.get("exp", time.time()))
+            ttl = max(1, expires_at - int(time.time()))
+            client = redis_client()
+            if client and payload.get("jti"):
+                client.setex(f"jwt:revoked:{payload['jti']}", ttl, "1")
+        except (jwt.InvalidTokenError, redis.RedisError):
+            pass
     return {"code": 200, "message": "已退出登录"}
 
 
 @app.post("/media/init-upload")
 def init_upload(filename: str, totalChunks: int, user: User = Depends(current_user)) -> str:
+    enforce_rate_limit(f"upload-init:{user.id}", 20, 3600)
     max_chunks = max(1, MAX_UPLOAD_BYTES // MAX_CHUNK_BYTES)
     if totalChunks <= 0 or totalChunks > max_chunks:
         raise HTTPException(status_code=400, detail="totalChunks 不合法")
@@ -866,6 +1014,15 @@ def complete_upload(uploadId: str, user: User = Depends(current_user)) -> dict[s
             for part in parts:
                 with part.open("rb") as source:
                     shutil.copyfileobj(source, output)
+        if env("VALIDATE_VIDEO_CONTENT", "false").lower() in {"1", "true", "yes"}:
+            try:
+                validate_video_file(temporary_path)
+            except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as exc:
+                temporary_path.unlink(missing_ok=True)
+                db.delete(session)
+                db.commit()
+                shutil.rmtree(directory, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=f"视频校验失败：{exc}") from exc
         content_hash = md5_file(temporary_path)
         existing = db.scalar(select(Media).where(Media.user_id == user.id, Media.content_hash == content_hash))
         if existing:
@@ -911,6 +1068,7 @@ def delete_media(id: int, user: User = Depends(current_user)) -> str:
 
 @app.post("/analysis/ai")
 def start_analysis(id: int, goal: str = Query(default="理解视频核心内容并生成结构化分析报告", max_length=500), user: User = Depends(current_user)) -> JSONResponse:
+    enforce_rate_limit(f"analysis:{user.id}", 20, 3600)
     normalized_goal = goal.strip()
     if not normalized_goal:
         raise HTTPException(status_code=400, detail="分析目标不能为空")
@@ -985,6 +1143,7 @@ def analysis_status(id: int, goal: str, user: User = Depends(current_user)) -> d
 
 @app.post("/analysis/transcribe")
 def start_transcription(id: int, user: User = Depends(current_user)) -> JSONResponse:
+    enforce_rate_limit(f"transcription:{user.id}", 20, 3600)
     with SessionLocal() as db:
         media = owned_media(db, id, user)
         segments = collect_evidence(Path(media.file_path))

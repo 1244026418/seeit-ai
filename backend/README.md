@@ -43,10 +43,14 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 - 抽象 OpenAI 兼容 AI Provider，同时提供离线 Mock，方便无密钥演示。
 - 输出带时间戳证据的 Markdown 报告，并持久化计划、阶段耗时、引用支持率、继续追问和用户反馈。
 - 对模型异常提供最多 3 次有限重试；服务重启时会回收超时的 `PROCESSING` 任务。
+- 生产模式校验 JWT、MySQL、CORS 与 Alembic 配置，支持 Token 注销撤销和 Redis/内存双层接口限流。
+- 可在生产环境启用 FFprobe 视频轨道、格式和时长校验，并自动清理过期的上传会话与临时分片。
 
 ## 当前验证边界
 
 项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。OCR 依赖容器中的 Tesseract，RocketMQ 需要 Linux/Docker 动态库；对外描述时应以代码和测试能够验证的能力为准。
+
+服务器部署使用根目录的 `docker-compose.prod.yml`，详细步骤见 [`deploy/README.md`](../deploy/README.md)。
 
 ## 后续改进顺序
 

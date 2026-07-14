@@ -77,7 +77,22 @@ cd backend
 pytest -q
 ```
 
-当前接口测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、失败重试、证据评估和反馈持久化。
+当前 9 项测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、失败重试、证据评估、反馈持久化、JWT 撤销、生产配置校验和 FFprobe 视频校验。
+
+## 服务器部署
+
+项目提供面向 `2 核 8 GB` 单机的生产部署配置，完整运行 MySQL、Redis、RocketMQ、API、Worker、前端 Nginx 和 Caddy HTTPS。生产环境只对公网开放 `80/443`，数据库、缓存、消息队列和 API 均位于 Docker 内部网络。
+
+```bash
+cp deploy/.env.production.example deploy/.env.production
+# 修改域名、数据库密码、Redis 密码和 JWT_SECRET
+docker compose --env-file deploy/.env.production -f docker-compose.prod.yml config --quiet
+docker compose --env-file deploy/.env.production -f docker-compose.prod.yml up -d --build
+```
+
+详细的域名解析、安全组、首次启动、更新、备份和排错步骤见 [deploy/README.md](./deploy/README.md)。
+
+生产模式会强制检查 MySQL、Alembic、CORS 和 JWT 密钥配置；上传完成后使用 FFprobe 校验真实视频轨道与时长，并对登录、上传和分析接口执行限流。
 
 ## 项目结构
 
@@ -86,6 +101,8 @@ backend/                       Python/FastAPI 后端
 backend/alembic/               数据库迁移脚本
 client/                        Vue 3 前端
 docker-compose.yml             MySQL、Redis、RocketMQ、API 与 Worker
+docker-compose.prod.yml        2 核 8 GB 服务器生产编排
+deploy/                        HTTPS、生产环境模板、备份与部署文档
 ```
 
 ## 后续改进

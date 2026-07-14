@@ -21,6 +21,9 @@ def main() -> None:
     group = os.getenv("ROCKETMQ_CONSUMER_GROUP", "seeit-python-consumer")
     consumer = PushConsumer(group)
     consumer.set_namesrv_addr(nameserver)
+    thread_count = max(1, int(os.getenv("ROCKETMQ_CONSUME_THREADS", "1")))
+    if hasattr(consumer, "set_thread_count"):
+        consumer.set_thread_count(thread_count)
 
     def handle(message):
         try:

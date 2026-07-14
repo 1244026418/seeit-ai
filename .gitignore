@@ -12,4 +12,6 @@ __pycache__/
 data/
 node_modules/
 dist/
+deploy/.env.production
+backups/
  
