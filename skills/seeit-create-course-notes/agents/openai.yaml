@@ -1,0 +1,12 @@
+interface:
+  display_name: "SeeIt 课程笔记"
+  short_description: "基于视频证据生成带时间戳、章节结构和复习题的课程笔记"
+  default_prompt: "使用 $seeit-create-course-notes 为指定视频生成带时间戳的课程笔记。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "seeit-ai"
+      description: "SeeIt AI 视频证据与分析工具"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8001/mcp"

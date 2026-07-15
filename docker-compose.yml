@@ -82,6 +82,19 @@ services:
       rmqbroker:
         condition: service_started
 
+  mcp:
+    build: ./backend
+    command: python -m seeit.mcp_server --transport streamable-http --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    environment:
+      SEEIT_API_URL: http://api:9090
+      SEEIT_MCP_PUBLIC_URL: http://localhost:8001/mcp
+      SEEIT_MCP_ISSUER_URL: http://localhost:9090
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   seeit_mysql:
   seeit_uploads:

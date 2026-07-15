@@ -2,7 +2,7 @@
 
 本目录是 SeeIt AI 的 Python/FastAPI 后端，负责用户认证、本地视频上传、BV 号导入、异步分析任务和证据报告生成。核心流程如下：
 
-`本地上传/BV 导入 -> MySQL/SQLite 持久化 -> RocketMQ Worker -> FFmpeg/ASR -> 证据报告 -> 前端轮询`
+`本地上传/BV 导入 -> MySQL/SQLite 持久化 -> RocketMQ Worker -> FFmpeg/ASR -> Agent Tools -> Critic -> 证据报告`
 
 ## 本地启动
 
@@ -25,6 +25,7 @@ uvicorn seeit.main:app --reload --port 9090
 
 - API 地址：`http://localhost:9090`
 - OpenAPI 文档：`http://localhost:9090/docs`
+- MCP 地址：`http://localhost:8001/mcp`（Docker）
 
 默认开发数据库为 SQLite，默认 AI Provider 为结果稳定的本地 Mock。需要连接 MySQL 和 OpenAI 兼容模型时，在 `.env` 中配置 `DATABASE_URL`、`AI_BASE_URL` 和 `AI_API_KEY`。
 
@@ -42,7 +43,9 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 - 使用 Redis `SET NX EX` 和数据库唯一约束限制相同视频和分析目标重复提交。
 - 使用 FFmpeg 提取音频，解析 ASR 时间戳片段，并在开启 `OCR_ENABLED` 时抽取关键帧执行 Tesseract OCR。
 - 抽象 OpenAI 兼容 AI Provider，同时提供离线 Mock，方便无密钥演示。
-- 输出带时间戳证据的 Markdown 报告，并持久化计划、阶段耗时、引用支持率、继续追问和用户反馈。
+- 内置元数据、时间轴检索、证据窗口、引用校验和报告生成工具；真实模型通过 Function Calling 自主选择工具，Mock 模式执行确定性工具流水线。
+- 输出带时间戳证据的 Markdown 报告，并持久化动态计划、逐工具 Trace、阶段耗时、引用支持率、继续追问和用户反馈。
+- 运行独立 SeeIt MCP Server，通过用户 Bearer Token 暴露 13 个工具与 4 个资源模板，不直接访问数据库或绕过 FastAPI 权限边界。
 - 对模型异常提供最多 3 次有限重试；服务重启时会回收超时的 `PROCESSING` 任务。
 - 生产模式校验 JWT、MySQL、CORS 与 Alembic 配置，支持 Token 注销撤销和 Redis/内存双层接口限流。
 - 可在生产环境启用 FFprobe 视频轨道、格式和时长校验，并自动清理过期的上传会话与临时分片。
@@ -52,6 +55,24 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。OCR 依赖容器中的 Tesseract，RocketMQ 需要 Linux/Docker 动态库；B 站导入依赖对方公开页面与格式，平台策略变化时可能需要升级 `yt-dlp`。对外描述时应以代码和测试能够验证的能力为准。
 
 服务器部署使用根目录的 `docker-compose.prod.yml`，详细步骤见 [`deploy/README.md`](../deploy/README.md)。
+
+## MCP 本地运行
+
+先启动 API 并登录获得用户 Token，再执行：
+
+```bash
+$env:SEEIT_API_URL="http://127.0.0.1:9090"
+$env:SEEIT_MCP_TOKEN="你的用户令牌"
+python -m seeit.mcp_server --transport stdio
+```
+
+需要 HTTP 服务时使用：
+
+```bash
+python -m seeit.mcp_server --transport streamable-http --host 0.0.0.0 --port 8001
+```
+
+HTTP 客户端必须在 `Authorization: Bearer <token>` 请求头中携带网站登录 Token。不要把真实 Token 写进仓库、Skill 或 MCP 配置示例。
 
 ## 后续改进顺序
 

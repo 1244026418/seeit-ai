@@ -98,10 +98,22 @@ def test_register_upload_analyze_evaluate_and_feedback() -> None:
         plan = client.get("/analysis/agent-plan", params={"id": media_id, "goal": goal}, headers=headers).json()
         trace = client.get("/analysis/agent-trace", params={"id": media_id}, headers=headers).json()
         evaluation = client.get("/analysis/agent-evaluation", params={"id": media_id, "goal": goal}, headers=headers).json()
-        assert len(plan["tasks"]) == 3
+        assert len(plan["tasks"]) == 4
+        assert plan["intent"] == "STRUCTURED_SUMMARY"
         assert "EXECUTOR" in trace["stageDurationMs"]
+        assert trace["agentMode"] == "DETERMINISTIC_TOOL_PIPELINE"
+        assert trace["toolCallCount"] >= 4
+        tool_names = [item["tool"] for item in trace["toolCalls"]]
+        assert tool_names[0:2] == ["get_video_metadata", "search_timeline"]
+        assert "get_evidence_window" in tool_names
+        assert tool_names[-1] == "generate_report"
         assert evaluation["structuredValid"] is True
         assert evaluation["evidenceSupportRate"] == 1.0
+
+        task_status = client.get("/analysis/task-status", params={"taskId": task_id}, headers=headers).json()
+        report = client.get("/analysis/report", params={"id": media_id, "goal": goal}, headers=headers).json()
+        assert task_status["state"] == "COMPLETED"
+        assert report["report"] == status["result"]
 
         transcription = client.get("/analysis/transcription-status", params={"id": media_id}, headers=headers).json()
         assert transcription["state"] == "COMPLETED"
@@ -142,6 +154,66 @@ def test_user_resources_are_isolated() -> None:
         assert client.get("/media/list", headers=other).json() == []
         assert client.post("/analysis/ai", params={"id": media_id}, headers=other).status_code == 404
         assert client.delete("/media/delete", params={"id": media_id}, headers=other).status_code == 404
+
+
+def test_agent_tool_api_searches_windows_and_verifies_owned_evidence() -> None:
+    with TestClient(main.app) as client:
+        owner = register(client, "toolowner")
+        other = register(client, "toolother")
+        media_id = upload(client, owner, b"agent-tool-video")
+        with main.SessionLocal() as db:
+            media = db.get(main.Media, media_id)
+            Path(media.file_path + ".segments.json").write_text(json.dumps({"segments": [
+                {"start": 5, "end": 9, "source": "ASR", "text": "首先创建数据库索引。"},
+                {"start": 10, "end": 14, "source": "OCR", "text": "EXPLAIN 查询执行计划"},
+            ]}, ensure_ascii=False), encoding="utf-8")
+
+        metadata = client.get(
+            "/agent/tools/video-metadata",
+            params={"id": media_id},
+            headers=owner,
+        ).json()
+        assert metadata["evidenceSegmentCount"] == 0
+
+        search = client.post(
+            "/agent/tools/search-timeline",
+            json={"mediaId": media_id, "query": "数据库索引", "topK": 3, "sources": ["ASR"]},
+            headers=owner,
+        ).json()
+        assert search["matches"][0]["content"] == "首先创建数据库索引。"
+        assert search["matches"][0]["startMs"] == 5000
+        metadata = client.get(
+            "/agent/tools/video-metadata",
+            params={"id": media_id},
+            headers=owner,
+        ).json()
+        assert metadata["evidenceSegmentCount"] == 2
+
+        window = client.post(
+            "/agent/tools/evidence-window",
+            json={"mediaId": media_id, "timestampMs": 10000, "beforeMs": 6000, "afterMs": 6000},
+            headers=owner,
+        ).json()
+        assert len(window["segments"]) == 2
+
+        verification = client.post(
+            "/agent/tools/verify-citations",
+            json={"mediaId": media_id, "citations": [{
+                "timestampMs": 5000,
+                "source": "ASR",
+                "content": "首先创建数据库索引。",
+            }]},
+            headers=owner,
+        ).json()
+        assert verification["evidenceSupportRate"] == 1.0
+        assert verification["citations"][0]["supported"] is True
+
+        denied = client.post(
+            "/agent/tools/search-timeline",
+            json={"mediaId": media_id, "query": "数据库", "topK": 3, "sources": []},
+            headers=other,
+        )
+        assert denied.status_code == 404
 
 
 def test_duplicate_active_analysis_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -225,6 +297,50 @@ def test_failed_analysis_retries_then_becomes_terminal(monkeypatch: pytest.Monke
             assert task.state == "FAILED"
             assert task.attempt_count == 3
             assert task.active_key is None
+
+
+def test_openai_compatible_provider_executes_model_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    toolbox = main.AgentToolbox(
+        metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
+        segments=[{
+            "segmentId": 1,
+            "source": "ASR",
+            "startMs": 5000,
+            "endMs": 9000,
+            "content": "首先创建数据库索引。",
+        }],
+        normalize_report=main.normalize_analysis_result,
+        evaluate_report=main.evaluate_result,
+    )
+    responses = iter([
+        {"content": None, "tool_calls": [
+            {"id": "call-1", "function": {"name": "get_video_metadata", "arguments": "{}"}},
+            {"id": "call-2", "function": {"name": "search_timeline", "arguments": json.dumps({"query": "数据库索引", "top_k": 3})}},
+        ]},
+        {"content": None, "tool_calls": [
+            {"id": "call-3", "function": {"name": "get_evidence_window", "arguments": json.dumps({"timestamp_ms": 5000})}},
+        ]},
+        {"content": None, "tool_calls": [
+            {"id": "call-4", "function": {"name": "generate_report", "arguments": json.dumps({
+                "title": "索引课程笔记",
+                "conclusions": ["视频首先要求创建数据库索引。"],
+                "evidence": [{"timestampMs": 5000, "source": "ASR", "content": "首先创建数据库索引。"}],
+                "suggestions": ["回看对应操作。"],
+            }, ensure_ascii=False)}},
+        ]},
+    ])
+    provider = main.OpenAICompatibleProvider("https://example.com/v1", "test-key", "test-model")
+    monkeypatch.setattr(provider, "_completion", lambda messages, tools=None: next(responses))
+
+    result = provider.run_agent(toolbox, "整理数据库索引操作")
+
+    assert result["accepted"] is True
+    assert [item["tool"] for item in toolbox.trace()] == [
+        "get_video_metadata",
+        "search_timeline",
+        "get_evidence_window",
+        "generate_report",
+    ]
 
 
 def test_chunk_size_and_authentication_errors(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,10 +8,20 @@ export const DEMO_ITEM = {
 
 export const DEMO_PLAN = {
   understoodGoal: '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议',
-  tasks: ['定位视频章节与核心主题', '融合 ASR 与关键帧 OCR 证据', '提炼结论并进行 Critic 校验']
+  intent: 'STRUCTURED_SUMMARY',
+  tasks: ['读取视频元数据并确定总结范围', '检索主题、观点和示例相关的时间轴证据', '展开关键证据窗口并生成结构化报告', '校验结论、引用和报告结构']
 }
 
 export const DEMO_TRACE = {
+  agentMode: 'MODEL_TOOL_CALLING',
+  toolCallCount: 5,
+  toolCalls: [
+    { index: 1, tool: 'get_video_metadata', durationMs: 3, success: true },
+    { index: 2, tool: 'search_timeline', durationMs: 18, success: true },
+    { index: 3, tool: 'get_evidence_window', durationMs: 2, success: true },
+    { index: 4, tool: 'verify_citations', durationMs: 4, success: true },
+    { index: 5, tool: 'generate_report', durationMs: 5, success: true }
+  ],
   stageDurationMs: {
     VIDEO_CONTEXT: 12840,
     RETRIEVAL: 860,

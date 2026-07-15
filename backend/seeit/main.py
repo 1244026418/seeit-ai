@@ -30,6 +30,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Te
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
+from seeit.agent import AgentToolbox, build_agent_plan
 from seeit.bilibili import (
     BilibiliImportError,
     download_bilibili_video,
@@ -208,12 +209,62 @@ class FeedbackRequest(BaseModel):
     comment: Optional[str] = Field(default=None, max_length=1000)
 
 
+class TimelineSearchRequest(BaseModel):
+    mediaId: int
+    query: str = Field(min_length=1, max_length=500)
+    topK: int = Field(default=8, ge=1, le=20)
+    sources: list[str] = Field(default_factory=list)
+
+
+class EvidenceWindowRequest(BaseModel):
+    mediaId: int
+    timestampMs: int = Field(ge=0)
+    beforeMs: int = Field(default=15000, ge=0, le=120000)
+    afterMs: int = Field(default=15000, ge=0, le=120000)
+
+
+class CitationRequest(BaseModel):
+    timestampMs: int = Field(ge=0)
+    source: str = Field(min_length=1, max_length=20)
+    content: str = Field(min_length=1, max_length=2000)
+
+
+class CitationVerificationRequest(BaseModel):
+    mediaId: int
+    citations: list[CitationRequest] = Field(min_length=1, max_length=20)
+
+
 class Provider:
+    agent_mode = "DETERMINISTIC_TOOL_PIPELINE"
+
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         raise NotImplementedError
 
     def follow_up(self, report: str, question: str) -> str:
         raise NotImplementedError
+
+    def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
+        toolbox.execute("get_video_metadata")
+        search = toolbox.execute("search_timeline", {"query": goal, "top_k": 8})
+        matches = search.get("matches", []) if search.get("ok") else []
+        selected_segments: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for match in matches[:3]:
+            window = toolbox.execute("get_evidence_window", {
+                "timestamp_ms": int(match.get("startMs", 0)),
+                "before_ms": 15000,
+                "after_ms": 15000,
+            })
+            for segment in window.get("segments", []):
+                segment_id = str(segment.get("segmentId"))
+                if segment_id not in seen:
+                    selected_segments.append(segment)
+                    seen.add(segment_id)
+        if not selected_segments:
+            selected_segments = matches
+        transcript = evidence_context(selected_segments)
+        candidate = self.analyze(transcript, goal)
+        return toolbox.execute("generate_report", candidate)
 
 
 class MockProvider(Provider):
@@ -236,21 +287,38 @@ class MockProvider(Provider):
 
 
 class OpenAICompatibleProvider(Provider):
+    agent_mode = "MODEL_TOOL_CALLING"
+
     def __init__(self, base_url: str, api_key: str, model: str):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
         self.model = model
 
-    def _chat(self, prompt: str) -> str:
+    def _completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         response = httpx.post(
             self.url,
             headers={"Authorization": f"Bearer {self.api_key}"},
-            json={"model": self.model, "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]},
+            json=payload,
             timeout=120,
         )
         response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+        return response.json()["choices"][0]["message"]
+
+    def _chat(self, prompt: str) -> str:
+        message = self._completion([{"role": "user", "content": prompt}])
+        return str(message.get("content") or "")
 
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         prompt = (
@@ -267,6 +335,71 @@ class OpenAICompatibleProvider(Provider):
 
     def follow_up(self, report: str, question: str) -> str:
         return self._chat(f"根据报告回答问题，不要编造事实。\n报告：{report}\n问题：{question}")
+
+    def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 SeeIt AI 的视频证据 Agent。必须先调用工具读取和检索视频，"
+                    "只根据工具返回的 ASR/OCR 证据回答。不得编造时间戳或视频事实。"
+                    "完成后调用 generate_report；如果 Critic 未通过，继续检索并修订。"
+                ),
+            },
+            {"role": "user", "content": f"分析目标：{goal}"},
+        ]
+        last_report: Optional[dict[str, Any]] = None
+        max_steps = max(3, min(int(env("AGENT_MAX_TOOL_STEPS", "8")), 12))
+        for _ in range(max_steps):
+            message = self._completion(messages, toolbox.tool_schemas())
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                content = str(message.get("content") or "").replace("```json", "").replace("```", "").strip()
+                start, end = content.find("{"), content.rfind("}")
+                if start >= 0 and end > start:
+                    try:
+                        candidate = json.loads(content[start : end + 1])
+                    except json.JSONDecodeError:
+                        candidate = {}
+                    generated = toolbox.execute("generate_report", candidate)
+                    if generated.get("ok"):
+                        last_report = generated
+                        if generated.get("accepted"):
+                            return generated
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": "请继续调用证据工具，并通过 generate_report 提交可校验的最终报告。",
+                })
+                continue
+
+            messages.append({
+                "role": "assistant",
+                "content": message.get("content"),
+                "tool_calls": tool_calls,
+            })
+            for call in tool_calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                raw_arguments = function.get("arguments") or "{}"
+                try:
+                    arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    arguments = {"invalid_arguments": str(raw_arguments)[:1000]}
+                result = toolbox.execute(name, arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or uuid.uuid4()),
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                if name == "generate_report" and result.get("ok"):
+                    last_report = result
+            if last_report and last_report.get("accepted"):
+                return last_report
+
+        if last_report:
+            return last_report
+        return super().run_agent(toolbox, goal)
 
 
 def provider() -> Provider:
@@ -562,9 +695,46 @@ def stored_evidence(db: Session, media_id: int) -> list[dict[str, Any]]:
         select(EvidenceSegment).where(EvidenceSegment.media_id == media_id).order_by(EvidenceSegment.start_ms, EvidenceSegment.id)
     ).all()
     return [
-        {"source": row.source, "startMs": row.start_ms, "endMs": row.end_ms, "content": row.content}
+        {
+            "segmentId": row.id,
+            "source": row.source,
+            "startMs": row.start_ms,
+            "endMs": row.end_ms,
+            "content": row.content,
+        }
         for row in rows
     ]
+
+
+def ensure_media_evidence(db: Session, media: Media) -> list[dict[str, Any]]:
+    segments = stored_evidence(db, media.id)
+    if segments:
+        return segments
+    collected = collect_evidence(Path(media.file_path))
+    replace_evidence(db, media.id, collected)
+    db.flush()
+    segments = stored_evidence(db, media.id)
+    text_segments = [item["content"] for item in segments if item["source"] == "ASR"]
+    media.transcript_text = "\n".join(text_segments) or evidence_context(segments)
+    return segments
+
+
+def agent_toolbox(db: Session, media: Media, *, ensure_evidence: bool = True) -> AgentToolbox:
+    segments = ensure_media_evidence(db, media) if ensure_evidence else stored_evidence(db, media.id)
+    return AgentToolbox(
+        metadata={
+            "mediaId": media.id,
+            "filename": media.filename,
+            "sourceType": media.source_type,
+            "sourceRef": media.source_ref,
+            "status": media.status,
+            "uploadedAt": media.upload_time.isoformat() if media.upload_time else None,
+            "hasAnalysisReport": bool(media.ai_summary),
+        },
+        segments=segments,
+        normalize_report=normalize_analysis_result,
+        evaluate_report=evaluate_result,
+    )
 
 
 def normalize_analysis_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -625,10 +795,7 @@ def evaluate_result(result: dict[str, Any], segments: list[dict[str, Any]]) -> d
 
 
 def build_plan(goal: str) -> dict[str, Any]:
-    return {
-        "understoodGoal": goal,
-        "tasks": ["提取 ASR/OCR 时间轴证据", "按目标组织可核验结论", "校验证据引用与结构完整性"],
-    }
+    return build_agent_plan(goal)
 
 
 def format_timestamp(milliseconds: int) -> str:
@@ -786,33 +953,37 @@ def process_analysis(task_id: str) -> str:
             if not media:
                 raise RuntimeError("媒体不存在")
 
+            planner_started = time.perf_counter()
+            plan = build_plan(task.goal)
+            task.plan_json = json.dumps(plan, ensure_ascii=False)
+            planner_duration = int((time.perf_counter() - planner_started) * 1000)
+
             evidence_started = time.perf_counter()
-            segments = stored_evidence(db, media.id)
-            if not segments:
-                segments = collect_evidence(Path(media.file_path))
-                replace_evidence(db, media.id, segments)
-            text_segments = [item["content"] for item in segments if item["source"] == "ASR"]
-            media.transcript_text = "\n".join(text_segments) or evidence_context(segments)
+            toolbox = agent_toolbox(db, media)
             evidence_duration = int((time.perf_counter() - evidence_started) * 1000)
 
             analysis_provider = provider()
             analysis_started = time.perf_counter()
-            result = normalize_analysis_result(analysis_provider.analyze(evidence_context(segments), task.goal))
+            generated = analysis_provider.run_agent(toolbox, task.goal)
             analysis_duration = int((time.perf_counter() - analysis_started) * 1000)
-
-            evaluation_started = time.perf_counter()
-            evaluation = evaluate_result(result, segments)
-            evaluation_duration = int((time.perf_counter() - evaluation_started) * 1000)
+            if not generated.get("ok") or not generated.get("report"):
+                raise ValueError(generated.get("error") or "Agent 未生成有效报告")
+            result = generated["report"]
+            evaluation = generated["evaluation"]
+            evaluation_duration = toolbox.duration_for("verify_citations", "generate_report")
             trace = {
                 "stageDurationMs": {
                     "VIDEO_CONTEXT": evidence_duration,
-                    "PLANNER": 0,
+                    "PLANNER": planner_duration,
                     "EXECUTOR": analysis_duration,
                     "CRITIC": evaluation_duration,
                 },
                 "provider": analysis_provider.__class__.__name__,
+                "agentMode": analysis_provider.agent_mode,
                 "attempt": task.attempt_count,
-                "evidenceSegmentCount": len(segments),
+                "evidenceSegmentCount": len(toolbox.segments),
+                "toolCallCount": len(toolbox.trace()),
+                "toolCalls": toolbox.trace(),
             }
 
             task.result = format_report(result)
@@ -1057,7 +1228,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="SeeIt AI API",
-    version="0.4.0",
+    version="0.5.0",
     root_path=env("ROOT_PATH", ""),
     lifespan=lifespan,
 )
@@ -1116,6 +1287,16 @@ def logout(authorization: Optional[str] = Header(default=None), _: User = Depend
         except (jwt.InvalidTokenError, redis.RedisError):
             pass
     return {"code": 200, "message": "已退出登录"}
+
+
+@app.get("/user/me")
+def user_me(user: User = Depends(current_user)) -> dict[str, Any]:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "nickname": user.nickname,
+        "role": user.role,
+    }
 
 
 def serialize_import_task(task: MediaImportTask) -> dict[str, Any]:
@@ -1491,6 +1672,65 @@ def transcription_status(id: int, user: User = Depends(current_user)) -> dict[st
         }
 
 
+@app.get("/agent/tools/video-metadata")
+def agent_video_metadata(id: int, user: User = Depends(current_user)) -> dict[str, Any]:
+    with SessionLocal() as db:
+        media = owned_media(db, id, user)
+        toolbox = agent_toolbox(db, media, ensure_evidence=False)
+        result = toolbox.execute("get_video_metadata")
+        return result
+
+
+@app.post("/agent/tools/search-timeline")
+def agent_search_timeline(
+    request: TimelineSearchRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        media = owned_media(db, request.mediaId, user)
+        toolbox = agent_toolbox(db, media)
+        result = toolbox.execute("search_timeline", {
+            "query": request.query,
+            "top_k": request.topK,
+            "sources": request.sources,
+        })
+        db.commit()
+        return result
+
+
+@app.post("/agent/tools/evidence-window")
+def agent_evidence_window(
+    request: EvidenceWindowRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        media = owned_media(db, request.mediaId, user)
+        toolbox = agent_toolbox(db, media)
+        result = toolbox.execute("get_evidence_window", {
+            "timestamp_ms": request.timestampMs,
+            "before_ms": request.beforeMs,
+            "after_ms": request.afterMs,
+        })
+        db.commit()
+        return result
+
+
+@app.post("/agent/tools/verify-citations")
+def agent_verify_citations(
+    request: CitationVerificationRequest,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        media = owned_media(db, request.mediaId, user)
+        toolbox = agent_toolbox(db, media)
+        result = toolbox.execute(
+            "verify_citations",
+            {"citations": [item.model_dump() for item in request.citations]},
+        )
+        db.commit()
+        return result
+
+
 @app.post("/analysis/follow-up")
 def follow_up(id: int, question: str = Query(min_length=1, max_length=500), user: User = Depends(current_user)) -> str:
     with SessionLocal() as db:
@@ -1506,6 +1746,62 @@ def latest_task(db: Session, media_id: int, goal: Optional[str] = None) -> Optio
         goal_hash = hashlib.sha256(goal.strip().encode("utf-8")).hexdigest()
         statement = statement.where(AnalysisTask.goal_hash == goal_hash)
     return db.scalar(statement.order_by(AnalysisTask.created_at.desc()))
+
+
+def analysis_task_payload(task: AnalysisTask) -> dict[str, Any]:
+    messages = {
+        "QUEUED": "任务已排队",
+        "PROCESSING": "正在分析",
+        "RETRYING": f"第 {task.attempt_count} 次执行失败，等待重试",
+        "COMPLETED": "分析完成",
+        "FAILED": task.error or "分析失败",
+    }
+    return {
+        "taskId": task.id,
+        "mediaId": task.media_id,
+        "goal": task.goal,
+        "state": task.state,
+        "attemptCount": task.attempt_count,
+        "report": task.result,
+        "evaluation": json.loads(task.evaluation_json) if task.evaluation_json else None,
+        "trace": json.loads(task.trace_json) if task.trace_json else None,
+        "message": messages.get(task.state, task.error or task.state),
+    }
+
+
+@app.get("/analysis/task-status")
+def analysis_task_status(taskId: str, user: User = Depends(current_user)) -> dict[str, Any]:
+    with SessionLocal() as db:
+        task = db.get(AnalysisTask, taskId)
+        if not task or task.user_id != user.id:
+            raise HTTPException(status_code=404, detail="分析任务不存在")
+        return analysis_task_payload(task)
+
+
+@app.get("/analysis/report")
+def analysis_report(
+    id: int,
+    goal: Optional[str] = Query(default=None, max_length=500),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        media = owned_media(db, id, user)
+        task = latest_task(db, id, goal)
+        if task:
+            return analysis_task_payload(task)
+        if media.ai_summary:
+            return {
+                "taskId": None,
+                "mediaId": media.id,
+                "goal": goal,
+                "state": "COMPLETED",
+                "attemptCount": 0,
+                "report": media.ai_summary,
+                "evaluation": None,
+                "trace": None,
+                "message": "分析完成",
+            }
+        raise HTTPException(status_code=404, detail="尚无分析报告")
 
 
 @app.get("/analysis/agent-plan")

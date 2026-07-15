@@ -1,0 +1,12 @@
+interface:
+  display_name: "SeeIt 会议复盘"
+  short_description: "从会议视频提取决策、待办、负责人、风险及对应时间戳证据"
+  default_prompt: "使用 $seeit-review-meeting 对指定会议视频生成证据化复盘。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "seeit-ai"
+      description: "SeeIt AI 视频证据与分析工具"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8001/mcp"

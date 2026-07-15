@@ -1,0 +1,12 @@
+interface:
+  display_name: "SeeIt 证据审计"
+  short_description: "逐条核验视频报告结论、引用内容与原始时间戳证据的一致性"
+  default_prompt: "使用 $seeit-audit-evidence 审计指定视频报告的证据可靠性。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "seeit-ai"
+      description: "SeeIt AI 视频证据与分析工具"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8001/mcp"

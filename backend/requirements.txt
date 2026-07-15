@@ -4,11 +4,13 @@ sqlalchemy==2.0.37
 alembic==1.14.0
 pymysql[rsa]==1.1.1
 python-multipart==0.0.20
-PyJWT==2.9.0
+PyJWT==2.10.1
 httpx==0.28.1
 redis==5.2.1
 python-dotenv==1.0.1
 eval-type-backport==0.2.2
+mcp==1.28.1
+sse-starlette==3.0.3
 pytest==8.3.4
 pytest-asyncio==0.24.0
 yt-dlp==2026.7.4

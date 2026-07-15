@@ -134,6 +134,7 @@ services:
       AI_BASE_URL: ${AI_BASE_URL}
       AI_API_KEY: ${AI_API_KEY}
       AI_MODEL: ${AI_MODEL}
+      AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS}
       ASR_BASE_URL: ${ASR_BASE_URL}
       ASR_API_KEY: ${ASR_API_KEY}
       ASR_MODEL: ${ASR_MODEL}
@@ -188,6 +189,7 @@ services:
       AI_BASE_URL: ${AI_BASE_URL}
       AI_API_KEY: ${AI_API_KEY}
       AI_MODEL: ${AI_MODEL}
+      AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS}
       ASR_BASE_URL: ${ASR_BASE_URL}
       ASR_API_KEY: ${ASR_API_KEY}
       ASR_MODEL: ${ASR_MODEL}
@@ -205,6 +207,32 @@ services:
         condition: service_started
     mem_limit: 1024m
     cpus: ${WORKER_CPU_LIMIT:-1.0}
+    logging: *default-logging
+
+  mcp:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    restart: unless-stopped
+    command: python -m seeit.mcp_server --transport streamable-http --host 0.0.0.0 --port 8001
+    environment:
+      SEEIT_API_URL: http://api:9090
+      SEEIT_MCP_PUBLIC_URL: https://${DOMAIN}/mcp
+      SEEIT_MCP_ISSUER_URL: https://${DOMAIN}/api
+      LOG_LEVEL: ${LOG_LEVEL}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 256m
+    cpus: 0.2
     logging: *default-logging
 
   frontend:
@@ -238,6 +266,8 @@ services:
     depends_on:
       frontend:
         condition: service_started
+      mcp:
+        condition: service_healthy
     mem_limit: 192m
     cpus: 0.2
     logging: *default-logging

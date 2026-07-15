@@ -1,0 +1,12 @@
+interface:
+  display_name: "SeeIt 操作指南"
+  short_description: "从教程视频提取有序操作步骤、前置条件、注意事项和时间戳证据"
+  default_prompt: "使用 $seeit-extract-operation-guide 从指定教程视频提取可执行操作指南。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "seeit-ai"
+      description: "SeeIt AI 视频证据与分析工具"
+      transport: "streamable_http"
+      url: "http://127.0.0.1:8001/mcp"

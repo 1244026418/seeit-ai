@@ -261,7 +261,7 @@
           <div v-else>
             <div v-if="sidebar.type === 'ai'">
               <div class="markdown-content" v-html="renderedMarkdown"></div>
-              <div v-if="sidebar.plan?.tasks?.length || traceStages.length" class="agent-inspector">
+              <div v-if="sidebar.plan?.tasks?.length || traceStages.length || traceToolCalls.length" class="agent-inspector">
                 <div v-if="sidebar.plan?.tasks?.length" class="agent-meta-block">
                   <span class="meta-label">Planner 任务</span>
                   <ol><li v-for="task in sidebar.plan.tasks" :key="task">{{ task }}</li></ol>
@@ -269,6 +269,17 @@
                 <div v-if="traceStages.length" class="agent-meta-block">
                   <span class="meta-label">执行轨迹</span>
                   <div class="stage-list"><span v-for="stage in traceStages" :key="stage[0]">{{ stage[0] }} · {{ stage[1] }}ms</span></div>
+                </div>
+                <div v-if="traceToolCalls.length" class="agent-meta-block">
+                  <span class="meta-label">工具调用 · {{ sidebar.trace.agentMode }} · {{ traceToolCalls.length }} 次</span>
+                  <div class="tool-call-list">
+                    <div v-for="call in traceToolCalls" :key="call.index" class="tool-call-item">
+                      <code>{{ call.tool }}</code>
+                      <span :class="call.success ? 'is-success' : 'is-failed'">
+                        {{ call.success ? '成功' : '失败' }} · {{ call.durationMs }}ms
+                      </span>
+                    </div>
+                  </div>
                 </div>
                 <div v-if="sidebar.evaluation && Object.keys(sidebar.evaluation).length" class="quality-row">
                   <span>结构完整 {{ sidebar.evaluation.structuredValid ? '通过' : '待完善' }}</span>
@@ -377,6 +388,7 @@ const authError = ref(false)
 const authForm = ref({ username: '', password: '', nickname: '' })
 const pollingTimers = ref({})
 const traceStages = computed(() => Object.entries(sidebar.value.trace?.stageDurationMs || {}))
+const traceToolCalls = computed(() => sidebar.value.trace?.toolCalls || [])
 const MARKDOWN_TAGS = new Set([
   'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'BR', 'HR', 'BLOCKQUOTE',
   'UL', 'OL', 'LI', 'STRONG', 'EM', 'DEL', 'CODE', 'PRE', 'A',
@@ -1358,6 +1370,15 @@ html, body, #app {
   border: 1px solid var(--border-tech); border-radius: 4px; padding: 6px 8px; color: var(--text-sub); font-size: 0.78rem;
 }
 .quality-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.tool-call-list { display: grid; gap: 7px; margin-top: 10px; }
+.tool-call-item {
+  min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 9px; border: 1px solid #242933; background: #080a0d;
+}
+.tool-call-item code { color: #d9dee7; font-size: 12px; overflow-wrap: anywhere; }
+.tool-call-item span { flex: 0 0 auto; color: #9da6b2; font-size: 11px; }
+.tool-call-item span.is-success { color: var(--accent-lime); }
+.tool-call-item span.is-failed { color: #ff6b6b; }
 .follow-up-box { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 24px; }
 .follow-up-box textarea { min-height: 76px; }
 .follow-up-box button {
@@ -1825,6 +1846,13 @@ html, body, #app {
 }
 
 .app-stage .agent-meta-block ol { color: #4f5c66 !important; }
+
+.app-stage .tool-call-item {
+  border-color: var(--border-tech) !important;
+  background: #ffffff !important;
+}
+
+.app-stage .tool-call-item code { color: #34414a !important; }
 
 .app-stage .goal-presets button,
 .app-stage .feedback-row button,

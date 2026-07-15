@@ -1,6 +1,6 @@
 # SeeIt AI 服务器部署
 
-这套配置面向一台 `2 核 8 GB` 的 Ubuntu 云服务器，使用 Docker Compose 运行 MySQL、Redis、RocketMQ、FastAPI、Worker、Vue/Nginx 和 Caddy。
+这套配置面向一台 `2 核 8 GB` 的 Ubuntu 云服务器，使用 Docker Compose 运行 MySQL、Redis、RocketMQ、FastAPI、Worker、SeeIt MCP Server、Vue/Nginx 和 Caddy。
 
 ## 1. 服务器准备
 
@@ -73,6 +73,8 @@ curl https://你的域名/api/health
 
 浏览器访问 `https://你的域名`。OpenAPI 文档地址为 `https://你的域名/api/docs`。
 
+MCP Streamable HTTP 地址为 `https://你的域名/mcp`。客户端需要使用网站登录接口签发的 JWT 作为 Bearer Token；不同用户的 Token 只能访问各自视频。不要将 Token 写入 GitHub、Skill 文件或公开截图。
+
 启动完成后可以执行一次无密钥生产冒烟。脚本会在 API 容器内生成 2 秒测试视频，依次验证注册、登录、三分片断点查询、视频校验、RocketMQ 异步分析、Agent 轨迹/评估/反馈和资源清理，并在最后输出消费者偏移与积压：
 
 ```bash
@@ -118,6 +120,7 @@ chmod +x deploy/backup-mysql.sh
 ```bash
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml logs --tail=100 api
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml logs --tail=100 worker
+docker compose --env-file deploy/.env.production -f docker-compose.prod.yml logs --tail=100 mcp
 docker stats
 docker compose --env-file deploy/.env.production -f docker-compose.prod.yml restart worker
 ```

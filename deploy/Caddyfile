@@ -1,7 +1,17 @@
 {$DOMAIN} {
     encode gzip
 
-    reverse_proxy frontend:80
+    handle /mcp* {
+        reverse_proxy mcp:8001
+    }
+
+    handle /.well-known/oauth-protected-resource* {
+        reverse_proxy mcp:8001
+    }
+
+    handle {
+        reverse_proxy frontend:80
+    }
 
     header {
         -Server
