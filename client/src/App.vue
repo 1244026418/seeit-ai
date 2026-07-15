@@ -247,7 +247,7 @@
           </div>
 
           <div v-else-if="sidebar.loading" class="agent-running">
-            <div class="loading-state"><div class="quantum-loader small"></div><p>Agent 正在分析视频证据...</p></div>
+            <div class="loading-state"><div class="quantum-loader small"></div><p>{{ sidebar.statusMessage || 'Agent 正在分析视频证据...' }}</p></div>
             <div v-if="sidebar.plan?.tasks?.length" class="agent-meta-block">
               <span class="meta-label">任务计划</span>
               <ol><li v-for="task in sidebar.plan.tasks" :key="task">{{ task }}</li></ol>
@@ -377,7 +377,10 @@ const sidebar = ref({
   plan: null,
   trace: null,
   evaluation: null,
-  feedback: null
+  feedback: null,
+  taskId: null,
+  taskState: null,
+  statusMessage: ''
 })
 const currentUser = ref(null)
 const showAuthModal = ref(false)
@@ -386,7 +389,7 @@ const authLoading = ref(false)
 const authMessage = ref('')
 const authError = ref(false)
 const authForm = ref({ username: '', password: '', nickname: '' })
-const pollingTimers = ref({})
+const pollingTimers = new Map()
 const traceStages = computed(() => Object.entries(sidebar.value.trace?.stageDurationMs || {}))
 const traceToolCalls = computed(() => sidebar.value.trace?.toolCalls || [])
 const MARKDOWN_TAGS = new Set([
@@ -396,15 +399,15 @@ const MARKDOWN_TAGS = new Set([
 ])
 
 const stopPolling = (id) => {
-  const polling = pollingTimers.value[id]
+  const polling = pollingTimers.get(id)
   if (!polling) return
   clearInterval(polling.timer)
   clearTimeout(polling.timeout)
-  delete pollingTimers.value[id]
+  pollingTimers.delete(id)
 }
 
 const stopAllPolling = () => {
-  Object.keys(pollingTimers.value).forEach(stopPolling)
+  Array.from(pollingTimers.keys()).forEach(stopPolling)
 }
 
 const renderedMarkdown = computed(() => {
@@ -794,7 +797,7 @@ const transcribe = async (id) => {
     sidebar.value.loading = false
     return
   }
-  if (pollingTimers.value[id] && pollingTimers.value[id].type === 'text') {
+  if (pollingTimers.get(id)?.type === 'text') {
     openSidebar('text', '全量文字提取')
     sidebar.value.mediaId = id
     sidebar.value.loading = true
@@ -828,44 +831,69 @@ const transcribe = async (id) => {
 }
 
 const aiAnalyze = async (id, goal) => {
-  if (pollingTimers.value[id] && pollingTimers.value[id].type === 'ai') {
+  if (pollingTimers.get(id)?.type === 'ai') {
     sidebar.value.mode = 'result'
     sidebar.value.loading = true
+    sidebar.value.statusMessage = '正在恢复分析任务状态...'
     return
   }
 
   sidebar.value.loading = true
   sidebar.value.mode = 'result'
   sidebar.value.content = ''
+  sidebar.value.taskState = 'SUBMITTING'
+  sidebar.value.statusMessage = '正在提交分析任务...'
 
   try {
     const params = new URLSearchParams({ id: String(id), goal })
-    const res = await apiRequest(`/analysis/ai?${params}`, { method: 'POST' })
+    const res = await apiRequest(`/analysis/ai?${params}`, { method: 'POST', timeoutMs: 15000 })
     const text = await res.text()
-    if (!res.ok) {
-      showMsg(text, true)
+    let payload = {}
+    try { payload = text ? JSON.parse(text) : {} } catch (_) {}
+    if (!res.ok && !(res.status === 409 && payload.taskId)) {
+      const errorMessage = payload.detail || payload.message || text || '分析任务提交失败'
+      showMsg(errorMessage, true)
       sidebar.value.loading = false
-      sidebar.value.content = text
+      sidebar.value.taskState = 'FAILED'
+      sidebar.value.statusMessage = errorMessage
+      sidebar.value.content = errorMessage
       return
     }
 
-    startPolling(id, 'ai', goal)
+    if (!payload.taskId) throw new Error('服务端未返回分析任务 ID')
+    sidebar.value.taskId = payload.taskId
+    sidebar.value.taskState = 'QUEUED'
+    sidebar.value.statusMessage = res.status === 409 ? '正在恢复已存在的分析任务...' : '任务已排队，等待 Worker 接收...'
+    startPolling(id, 'ai', goal, payload.taskId)
     refreshAgentMeta(id, goal, false)
 
   } catch (e) {
-    sidebar.value.content = "错误：" + e
+    sidebar.value.content = '错误：' + e.message
     sidebar.value.loading = false
+    sidebar.value.taskState = 'FAILED'
+    sidebar.value.statusMessage = e.message
   }
 }
 
-const startPolling = (id, type, goal = '') => {
+const startPolling = (id, type, goal = '', taskId = null) => {
   stopPolling(id)
-  const polling = { timer: null, timeout: null, type, inFlight: false, metaTick: 0 }
+  const polling = {
+    timer: null,
+    timeout: null,
+    type,
+    taskId,
+    inFlight: false,
+    metaTick: 0,
+    failures: 0,
+    startedAt: Date.now()
+  }
 
   const finish = async (result, failed = false) => {
     if (sidebar.value.visible && sidebar.value.type === type && sidebar.value.mediaId === id) {
       sidebar.value.content = result
       sidebar.value.loading = false
+      sidebar.value.taskState = failed ? 'FAILED' : 'COMPLETED'
+      sidebar.value.statusMessage = failed ? result : '分析完成'
       if (type === 'ai' && !failed) await refreshAgentMeta(id, goal, true)
     }
     showMsg(failed ? '任务执行失败，请稍后重试' : '任务完成', failed)
@@ -873,17 +901,31 @@ const startPolling = (id, type, goal = '') => {
   }
 
   const poll = async () => {
-    if (polling.inFlight || pollingTimers.value[id] !== polling) return
+    if (polling.inFlight || pollingTimers.get(id) !== polling) return
     polling.inFlight = true
     try {
       if (type === 'ai') {
         const params = new URLSearchParams({ id: String(id), goal })
-        const response = await apiRequest(`/analysis/analysis-status?${params}`)
+        const statusPath = polling.taskId
+          ? `/analysis/task-status?taskId=${encodeURIComponent(polling.taskId)}`
+          : `/analysis/analysis-status?${params}`
+        const response = await apiRequest(statusPath, { timeoutMs: 10000 })
         if (!response.ok) throw new Error(await response.text())
         const status = await response.json()
+        polling.failures = 0
+        sidebar.value.taskState = status.state
+        const elapsedSeconds = Math.max(0, Math.floor((Date.now() - polling.startedAt) / 1000))
+        const processingMessage = elapsedSeconds < 15
+          ? 'Worker 已接收，正在准备视频证据...'
+          : `正在执行语音转写与证据分析，已用时 ${elapsedSeconds} 秒。首次处理会比重复分析更久。`
+        sidebar.value.statusMessage = ({
+          QUEUED: '任务已排队，等待 Worker 接收...',
+          PROCESSING: processingMessage,
+          RETRYING: status.message || '本次执行失败，正在等待重试...'
+        })[status.state] || status.message || '正在同步任务状态...'
         if (status.state === 'COMPLETED') {
           await fetchList()
-          await finish(status.result || '分析完成')
+          await finish(status.report || status.result || '分析完成')
           return
         }
         if (status.state === 'FAILED') {
@@ -907,6 +949,13 @@ const startPolling = (id, type, goal = '') => {
       }
     } catch (error) {
       console.error('任务状态轮询失败', error)
+      polling.failures += 1
+      if (sidebar.value.mediaId === id) {
+        sidebar.value.statusMessage = `状态查询失败，正在重试（${polling.failures}/3）...`
+      }
+      if (polling.failures >= 3) {
+        await finish(`无法获取任务状态：${error.message}`, true)
+      }
     } finally {
       polling.inFlight = false
     }
@@ -914,13 +963,18 @@ const startPolling = (id, type, goal = '') => {
 
   polling.timer = setInterval(poll, 3000)
   polling.timeout = setTimeout(() => {
-    if (pollingTimers.value[id] === polling) {
+    if (pollingTimers.get(id) === polling) {
       stopPolling(id)
       showMsg('任务仍在后台执行，可稍后重新打开查看', true)
-      if (sidebar.value.mediaId === id) sidebar.value.loading = false
+      if (sidebar.value.mediaId === id) {
+        sidebar.value.loading = false
+        sidebar.value.taskState = 'BACKGROUND'
+        sidebar.value.statusMessage = '任务仍在后台执行'
+        sidebar.value.content = '任务仍在后台执行，可稍后重新打开或刷新页面查看结果。'
+      }
     }
   }, 300000)
-  pollingTimers.value[id] = polling
+  pollingTimers.set(id, polling)
   poll()
 }
 
@@ -930,6 +984,9 @@ const openSidebar = (type, title) => {
   sidebar.value.title = title
   sidebar.value.loading = true
   sidebar.value.content = ''
+  sidebar.value.taskId = null
+  sidebar.value.taskState = null
+  sidebar.value.statusMessage = ''
 }
 const closeSidebar = () => { sidebar.value.visible = false }
 
@@ -948,7 +1005,10 @@ const openAgent = (item) => {
     plan: null,
     trace: null,
     evaluation: null,
-    feedback: null
+    feedback: null,
+    taskId: null,
+    taskState: null,
+    statusMessage: ''
   }
 }
 

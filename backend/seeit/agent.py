@@ -83,7 +83,7 @@ class AgentToolbox:
         }
 
     @staticmethod
-    def _preview(value: Any, limit: int = 2400) -> str:
+    def _preview(value: Any, limit: int = 800) -> str:
         rendered = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
         return rendered if len(rendered) <= limit else rendered[:limit] + "..."
 

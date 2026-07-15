@@ -22,7 +22,7 @@ RUN set -eux; \
     installed=0; \
     for attempt in 1 2 3; do \
         if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update \
-            && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-chi-sim; then \
+            && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ffmpeg; then \
             installed=1; \
             break; \
         fi; \
@@ -71,7 +71,8 @@ RUN set -eux; \
 WORKDIR /app
 COPY requirements.txt requirements-rocketmq.txt ./
 ARG PIP_INDEX_URL=https://pypi.org/simple
-RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements-rocketmq.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url "$PIP_INDEX_URL" -r requirements-rocketmq.txt
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY docker-entrypoint.sh ./docker-entrypoint.sh

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete, select, update
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -54,8 +57,9 @@ MAX_IMPORT_ATTEMPTS = int(env("BILIBILI_IMPORT_ATTEMPTS", "3"))
 BILIBILI_MAX_DURATION_SECONDS = int(env("BILIBILI_MAX_DURATION_SECONDS", "600"))
 BILIBILI_MAX_FILE_BYTES = int(env("BILIBILI_MAX_FILE_BYTES", str(512 * 1024 * 1024)))
 STALE_TASK_SECONDS = int(env("STALE_TASK_SECONDS", "1800"))
+QUEUED_TASK_FALLBACK_SECONDS = max(1, int(env("QUEUED_TASK_FALLBACK_SECONDS", "10")))
 UPLOAD_SESSION_TTL_HOURS = int(env("UPLOAD_SESSION_TTL_HOURS", "24"))
-OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "10")))
+OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "30")))
 JWT_SECRET = env("JWT_SECRET", "development-only-change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = int(env("JWT_EXPIRE_HOURS", "24"))
@@ -65,6 +69,10 @@ logging.basicConfig(
     level=getattr(logging, env("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+
+_local_asr_model: Any = None
+_local_asr_model_key: tuple[Any, ...] | None = None
+_local_asr_lock = threading.Lock()
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args=connect_args)
@@ -157,7 +165,7 @@ class AnalysisTask(Base):
     result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     plan_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    trace_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    trace_json: Mapped[Optional[str]] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=True)
     evaluation_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -247,9 +255,22 @@ class Provider:
         toolbox.execute("get_video_metadata")
         search = toolbox.execute("search_timeline", {"query": goal, "top_k": 8})
         matches = search.get("matches", []) if search.get("ok") else []
+        timeline = [item for item in toolbox.segments if item.get("source") != "SYSTEM"]
+        anchor_matches: list[dict[str, Any]] = []
+        if timeline:
+            positions = sorted({
+                0,
+                len(timeline) // 4,
+                len(timeline) // 2,
+                (len(timeline) * 3) // 4,
+                len(timeline) - 1,
+            })
+            anchor_matches = [timeline[index] for index in positions]
+        if search.get("fallbackToTimelineStart"):
+            matches = anchor_matches
         selected_segments: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for match in matches[:3]:
+        for match in [*matches[:8], *anchor_matches]:
             window = toolbox.execute("get_evidence_window", {
                 "timestamp_ms": int(match.get("startMs", 0)),
                 "before_ms": 15000,
@@ -262,24 +283,83 @@ class Provider:
                     seen.add(segment_id)
         if not selected_segments:
             selected_segments = matches
+        selected_segments.sort(key=lambda item: (int(item.get("startMs", 0)), str(item.get("segmentId", ""))))
         transcript = evidence_context(selected_segments)
         candidate = self.analyze(transcript, goal)
         return toolbox.execute("generate_report", candidate)
 
 
 class MockProvider(Provider):
+    _topic_expansions = {
+        "型号": "型号 模型 版本 Sol Terra Luna",
+        "推理强度": "推理强度 Reasoning Effort None Low Medium High X-High Max",
+        "价格": "价格 定价 费用 成本 美元 输入 输出 百万 Token",
+        "适用场景": "适用场景 适合 任务 简单 通用 复杂 专业 编程",
+        "建议": "建议 最低 稳定 完成 推理强度 不要 默认 拉满 None Low Medium High X-High Max",
+    }
+
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         text = transcript.strip() or "未检测到可用转写内容。"
-        first_line = next((line for line in text.splitlines() if line.strip()), text)
-        match = re.match(r"\[(\d+)-(\d+)ms]\[([^]]+)]\s*(.*)", first_line)
-        timestamp_ms = int(match.group(1)) if match else 0
-        source = match.group(3) if match else "ASR"
-        evidence = (match.group(4) if match else first_line)[:300]
+        parsed: list[dict[str, Any]] = []
+        for line in text.splitlines():
+            match = re.match(r"\[(\d+)-(\d+)ms]\[([^]]+)]\s*(.*)", line.strip())
+            if not match or not match.group(4).strip():
+                continue
+            parsed.append({
+                "timestampMs": int(match.group(1)),
+                "source": match.group(3),
+                "content": match.group(4).strip()[:1800],
+            })
+        if not parsed:
+            first_line = next((line for line in text.splitlines() if line.strip()), text)
+            parsed = [{"timestampMs": 0, "source": "ASR", "content": first_line[:1800]}]
+
+        topic_matches: list[tuple[str, dict[str, Any]]] = []
+        for label, expanded_query in self._topic_expansions.items():
+            if label not in goal and not (label == "建议" and re.search(r"结论|推荐|最终", goal)):
+                continue
+            scored = [
+                (AgentToolbox._relevance(expanded_query, item["content"]), item)
+                for item in parsed
+            ]
+            best_score = max(score for score, _ in scored)
+            if label == "建议" and best_score > 0:
+                near_best = [item for score, item in scored if score >= best_score * 0.75]
+                best = max(near_best, key=lambda item: item["timestampMs"])
+            else:
+                best = max(scored, key=lambda pair: pair[0])[1]
+            if best_score > 0:
+                topic_matches.append((label, best))
+
+        positions = sorted({
+            0,
+            len(parsed) // 4,
+            len(parsed) // 2,
+            (len(parsed) * 3) // 4,
+            len(parsed) - 1,
+        })
+        candidates = [item for _, item in topic_matches] + [parsed[index] for index in positions]
+        evidence: list[dict[str, Any]] = []
+        seen: set[tuple[int, str, str]] = set()
+        for item in candidates:
+            key = (item["timestampMs"], item["source"], item["content"])
+            if key not in seen:
+                evidence.append(item)
+                seen.add(key)
+            if len(evidence) >= 8:
+                break
+        evidence.sort(key=lambda item: item["timestampMs"])
+        conclusions = [
+            f"围绕“{goal}”提取了 {len(evidence)} 组可核验证据，并覆盖视频开头、中段和结尾。",
+            *[f"{label}：{item['content'][:320]}" for label, item in topic_matches[:6]],
+        ]
+        if len(conclusions) == 1:
+            conclusions.extend(item["content"][:320] for item in evidence[:4])
         return {
             "title": "视频内容分析报告",
-            "conclusions": [f"围绕“{goal}”提取到可核验的视频内容。", evidence],
-            "evidence": [{"timestampMs": timestamp_ms, "source": source, "content": evidence}],
-            "suggestions": ["补充更具体的分析目标，以获得更精确的证据检索结果。"],
+            "conclusions": conclusions,
+            "evidence": evidence,
+            "suggestions": ["若需更强的归纳与追问能力，请配置真实 LLM Provider；当前报告为可复现的抽取式摘要。"],
         }
 
     def follow_up(self, report: str, question: str) -> str:
@@ -304,6 +384,9 @@ class OpenAICompatibleProvider(Provider):
             "temperature": 0.1,
             "messages": messages,
         }
+        thinking_mode = env("AI_THINKING_MODE").strip().lower()
+        if thinking_mode in {"enabled", "disabled"}:
+            payload["thinking"] = {"type": thinking_mode}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -311,7 +394,7 @@ class OpenAICompatibleProvider(Provider):
             self.url,
             headers={"Authorization": f"Bearer {self.api_key}"},
             json=payload,
-            timeout=120,
+            timeout=max(30, int(env("AI_REQUEST_TIMEOUT_SECONDS", "180"))),
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]
@@ -591,12 +674,13 @@ def extract_audio_file(video_path: Path, audio_path: Path) -> Path:
 def request_asr(audio_path: Path) -> list[dict[str, Any]]:
     asr_base_url = env("ASR_BASE_URL")
     asr_api_key = env("ASR_API_KEY")
-    if not asr_base_url or not asr_api_key:
+    if not asr_base_url:
         return []
+    headers = {"Authorization": f"Bearer {asr_api_key}"} if asr_api_key else {}
     with audio_path.open("rb") as audio:
         response = httpx.post(
             asr_base_url.rstrip("/") + "/audio/transcriptions",
-            headers={"Authorization": f"Bearer {asr_api_key}"},
+            headers=headers,
             data={"model": env("ASR_MODEL", "TeleAI/TeleSpeechASR"), "response_format": "verbose_json"},
             files={"file": (audio_path.name, audio, "audio/mpeg")},
             timeout=180,
@@ -610,53 +694,212 @@ def request_asr(audio_path: Path) -> list[dict[str, Any]]:
     return [{"source": "ASR", "startMs": 0, "endMs": 0, "content": text}] if text else []
 
 
+def local_asr_enabled() -> bool:
+    return env("LOCAL_ASR_ENABLED", "false").lower() in {"1", "true", "yes"}
+
+
+def local_asr_model() -> Any:
+    global _local_asr_model, _local_asr_model_key
+    model_name = env("LOCAL_ASR_MODEL", "base")
+    model_root = Path(env("LOCAL_ASR_MODEL_ROOT", str(UPLOAD_ROOT / "models"))).resolve()
+    device = env("LOCAL_ASR_DEVICE", "cpu")
+    compute_type = env("LOCAL_ASR_COMPUTE_TYPE", "int8")
+    cpu_threads = max(1, int(env("LOCAL_ASR_CPU_THREADS", "4")))
+    model_key = (model_name, str(model_root), device, compute_type, cpu_threads)
+    with _local_asr_lock:
+        if _local_asr_model is not None and _local_asr_model_key == model_key:
+            return _local_asr_model
+        from faster_whisper import WhisperModel
+
+        model_root.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter()
+        _local_asr_model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            download_root=str(model_root),
+        )
+        _local_asr_model_key = model_key
+        log.info(
+            "local_asr_model_loaded model=%s device=%s compute_type=%s elapsed_ms=%s",
+            model_name,
+            device,
+            compute_type,
+            int((time.perf_counter() - started) * 1000),
+        )
+        return _local_asr_model
+
+
+def warm_local_asr_model() -> None:
+    if local_asr_enabled() and env("LOCAL_ASR_PRELOAD", "true").lower() in {"1", "true", "yes"}:
+        local_asr_model()
+
+
+def release_local_asr_model() -> None:
+    global _local_asr_model, _local_asr_model_key
+    with _local_asr_lock:
+        if _local_asr_model is None:
+            return
+        _local_asr_model = None
+        _local_asr_model_key = None
+    gc.collect()
+    log.info("local_asr_model_released")
+
+
+def request_local_asr(media_path: Path) -> list[dict[str, Any]]:
+    model = local_asr_model()
+    started = time.perf_counter()
+    language = env("LOCAL_ASR_LANGUAGE", "zh").strip() or None
+    segments_iter, info = model.transcribe(
+        str(media_path),
+        language=language,
+        beam_size=max(1, int(env("LOCAL_ASR_BEAM_SIZE", "5"))),
+        vad_filter=env("LOCAL_ASR_VAD_FILTER", "true").lower() in {"1", "true", "yes"},
+        condition_on_previous_text=True,
+        initial_prompt=env("LOCAL_ASR_INITIAL_PROMPT") or None,
+        hotwords=env("LOCAL_ASR_HOTWORDS") or None,
+    )
+    segments = [
+        {
+            "source": "ASR",
+            "startMs": max(0, int(item.start * 1000)),
+            "endMs": max(0, int(item.end * 1000)),
+            "content": item.text.strip(),
+        }
+        for item in segments_iter
+        if item.text.strip()
+    ]
+    log.info(
+        "local_asr_completed path=%s language=%s duration_seconds=%.3f segments=%s elapsed_ms=%s",
+        media_path.name,
+        getattr(info, "language", language),
+        float(getattr(info, "duration", 0) or 0),
+        len(segments),
+        int((time.perf_counter() - started) * 1000),
+    )
+    return segments
+
+
+def run_paddle_ocr_frames(directory: Path) -> dict[str, Any]:
+    output_path = directory / "paddle-results.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "seeit.ocr_runner",
+            "--input-dir",
+            str(directory),
+            "--output",
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=max(60, int(env("PADDLEOCR_PROCESS_TIMEOUT_SECONDS", "600"))),
+    )
+    if not output_path.exists():
+        log.error(
+            "paddle_ocr_process_failed returncode=%s stderr=%s",
+            completed.returncode,
+            completed.stderr[-4000:],
+        )
+        return {"frameCount": 0, "results": [], "errors": []}
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    if completed.returncode != 0 or payload.get("fatalError"):
+        log.error(
+            "paddle_ocr_process_failed returncode=%s fatal=%s stderr=%s",
+            completed.returncode,
+            payload.get("fatalError"),
+            completed.stderr[-4000:],
+        )
+    return payload
+
+
 def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
     if env("OCR_ENABLED", "false").lower() not in {"1", "true", "yes"}:
         return []
+    interval_seconds = max(1, int(env("OCR_INTERVAL_SECONDS", "30")))
+    max_frames = max(1, int(env("PADDLEOCR_MAX_FRAMES", "20")))
+    max_width = max(320, int(env("PADDLEOCR_FRAME_MAX_WIDTH", "960")))
+    dedup_threshold = min(1.0, max(0.0, float(env("PADDLEOCR_DEDUP_THRESHOLD", "0.88"))))
+    started = time.perf_counter()
     temp_root = UPLOAD_ROOT / "tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ocr-", dir=temp_root) as directory:
         frame_pattern = str(Path(directory) / "frame-%06d.jpg")
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(path), "-vf", f"fps=1/{OCR_INTERVAL_SECONDS}", "-q:v", "3", frame_pattern],
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(path),
+                "-vf",
+                f"fps=1/{interval_seconds},scale='min({max_width},iw)':-2",
+                "-frames:v",
+                str(max_frames),
+                "-q:v",
+                "3",
+                frame_pattern,
+            ],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=900,
         )
-        segments = []
-        for index, frame in enumerate(sorted(Path(directory).glob("frame-*.jpg"))):
-            completed = subprocess.run(
-                ["tesseract", str(frame), "stdout", "-l", env("OCR_LANG", "chi_sim+eng")],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                timeout=60,
-            )
-            content = re.sub(r"\s+", " ", completed.stdout).strip()
+        if env("LOCAL_ASR_RELEASE_BEFORE_OCR", "true").lower() in {"1", "true", "yes"}:
+            release_local_asr_model()
+        payload = run_paddle_ocr_frames(Path(directory))
+        for error in payload.get("errors", []):
+            log.warning("paddle_ocr_frame_failed frame=%s error=%s", error.get("frame"), error.get("error"))
+
+        segments: list[dict[str, Any]] = []
+        previous_content = ""
+        for item in payload.get("results", []):
+            index = max(0, int(item.get("index", 0)))
+            content = str(item.get("content", "")).strip()
+            if previous_content and _content_similarity(previous_content, content) >= dedup_threshold:
+                continue
             if content:
-                start_ms = index * OCR_INTERVAL_SECONDS * 1000
+                start_ms = index * interval_seconds * 1000
                 segments.append({
                     "source": "OCR",
                     "startMs": start_ms,
-                    "endMs": start_ms + OCR_INTERVAL_SECONDS * 1000,
+                    "endMs": start_ms + interval_seconds * 1000,
                     "content": content,
                 })
+                previous_content = content
+        log.info(
+            "paddle_ocr_completed path=%s frames=%s evidence=%s model_load_ms=%s runner_elapsed_ms=%s elapsed_ms=%s",
+            path.name,
+            int(payload.get("frameCount", 0)),
+            len(segments),
+            int(payload.get("modelLoadMs", 0)),
+            int(payload.get("elapsedMs", 0)),
+            int((time.perf_counter() - started) * 1000),
+        )
         return segments
 
 
 def collect_evidence(path: Path) -> list[dict[str, Any]]:
     segments = read_sidecar_evidence(path)
-    if not segments and env("ASR_BASE_URL") and env("ASR_API_KEY"):
+    if not segments and env("ASR_BASE_URL"):
         temp_dir = UPLOAD_ROOT / "tmp"
         audio_path = temp_dir / f"{uuid.uuid4()}.mp3"
         try:
             extract_audio_file(path, audio_path)
-            segments = request_asr(audio_path)
+            try:
+                segments = request_asr(audio_path)
+            except Exception:
+                if not local_asr_enabled():
+                    raise
+                log.exception("remote_asr_failed path=%s; falling back to local ASR", path.name)
         finally:
             audio_path.unlink(missing_ok=True)
+    if not segments and local_asr_enabled():
+        segments = request_local_asr(path)
     segments.extend(extract_ocr_evidence(path))
     if not segments:
         segments.append({
@@ -708,7 +951,9 @@ def stored_evidence(db: Session, media_id: int) -> list[dict[str, Any]]:
 
 def ensure_media_evidence(db: Session, media: Media) -> list[dict[str, Any]]:
     segments = stored_evidence(db, media.id)
-    if segments:
+    asr_available = bool(env("ASR_BASE_URL")) or local_asr_enabled()
+    has_asr = any(item["source"] == "ASR" for item in segments)
+    if segments and (not asr_available or has_asr):
         return segments
     collected = collect_evidence(Path(media.file_path))
     replace_evidence(db, media.id, collected)
@@ -737,13 +982,37 @@ def agent_toolbox(db: Session, media: Media, *, ensure_evidence: bool = True) ->
     )
 
 
+def _normalize_text_items(value: Any, limit: int) -> list[str]:
+    if isinstance(value, str):
+        candidates: list[Any] = value.splitlines() or [value]
+    elif isinstance(value, (list, tuple)):
+        candidates = list(value)
+    else:
+        candidates = []
+
+    normalized: list[str] = []
+    for item in candidates:
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        text = re.sub(r"^(?:[-*]|\d+[.)、])\s*", "", text).strip()
+        if text:
+            normalized.append(text[:1000])
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
 def normalize_analysis_result(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("模型分析结果不是 JSON 对象")
-    conclusions = [str(item).strip() for item in result.get("conclusions", []) if str(item).strip()][:10]
-    suggestions = [str(item).strip() for item in result.get("suggestions", []) if str(item).strip()][:10]
+    conclusions = _normalize_text_items(result.get("conclusions"), 10)
+    suggestions = _normalize_text_items(result.get("suggestions"), 10)
+    evidence_items = result.get("evidence") or []
+    if isinstance(evidence_items, dict):
+        evidence_items = [evidence_items]
+    if not isinstance(evidence_items, (list, tuple)):
+        evidence_items = []
     evidence = []
-    for item in result.get("evidence", [])[:20]:
+    for item in evidence_items[:20]:
         if not isinstance(item, dict):
             continue
         normalized = normalize_segment(item)
@@ -1149,6 +1418,21 @@ def recover_stale_tasks() -> None:
         db.commit()
     for task_id in stale_ids:
         publish_analysis(task_id)
+
+
+def stale_queued_analysis_task_ids(limit: int = 10) -> list[str]:
+    """Return queued tasks old enough for the worker fallback to claim safely."""
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=QUEUED_TASK_FALLBACK_SECONDS)
+    with SessionLocal() as db:
+        return list(db.scalars(
+            select(AnalysisTask.id)
+            .where(
+                AnalysisTask.state == "QUEUED",
+                AnalysisTask.updated_at < threshold,
+            )
+            .order_by(AnalysisTask.updated_at.asc())
+            .limit(max(1, limit))
+        ).all())
 
 
 def recover_stale_import_tasks() -> None:

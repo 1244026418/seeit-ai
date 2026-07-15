@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ os.environ["ROCKETMQ_NAMESERVER"] = ""
 os.environ["REDIS_URL"] = "redis://127.0.0.1:6399/15"
 
 import seeit.main as main
+import seeit.ocr_runner as ocr_runner
 from seeit.bilibili import DownloadedVideo
 
 
@@ -226,6 +228,228 @@ def test_duplicate_active_analysis_is_rejected(monkeypatch: pytest.MonkeyPatch) 
         assert first.status_code == 202
         assert second.status_code == 409
         assert second.json()["taskId"] == first.json()["taskId"]
+
+
+def test_stale_queued_analysis_is_discovered_for_worker_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TestClient(main.app) as client:
+        headers = register(client, "qfallback")
+        media_id = upload(client, headers, b"queue-fallback-video")
+        monkeypatch.setattr(main, "publish_analysis", lambda task_id: None)
+        task_id = client.post(
+            "/analysis/ai",
+            params={"id": media_id, "goal": "验证排队任务兜底"},
+            headers=headers,
+        ).json()["taskId"]
+
+        with main.SessionLocal() as db:
+            task = db.get(main.AnalysisTask, task_id)
+            task.updated_at = datetime.now(timezone.utc) - timedelta(
+                seconds=main.QUEUED_TASK_FALLBACK_SECONDS + 1,
+            )
+            db.commit()
+
+        assert task_id in main.stale_queued_analysis_task_ids()
+        assert main.process_analysis(task_id) == "COMPLETED"
+        assert task_id not in main.stale_queued_analysis_task_ids()
+
+
+def test_local_asr_returns_timestamped_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeSegment:
+        def __init__(self, start: float, end: float, text: str) -> None:
+            self.start = start
+            self.end = end
+            self.text = text
+
+    class FakeModel:
+        def transcribe(self, path: str, **kwargs: object):
+            calls["path"] = path
+            calls["kwargs"] = kwargs
+            return iter([
+                FakeSegment(1.25, 3.5, " GPT-5.6 提供三个型号。 "),
+                FakeSegment(65.0, 69.25, "应该选择能够稳定完成任务的最低推理强度。"),
+            ]), types.SimpleNamespace(language="zh", duration=70.0)
+
+    monkeypatch.setattr(main, "local_asr_model", lambda: FakeModel())
+    monkeypatch.setenv("LOCAL_ASR_LANGUAGE", "zh")
+    monkeypatch.setenv("LOCAL_ASR_BEAM_SIZE", "3")
+    monkeypatch.setenv("LOCAL_ASR_VAD_FILTER", "true")
+    monkeypatch.setenv("LOCAL_ASR_HOTWORDS", "GPT Sol Terra Luna")
+
+    segments = main.request_local_asr(Path("demo.mp4"))
+
+    assert segments == [
+        {
+            "source": "ASR",
+            "startMs": 1250,
+            "endMs": 3500,
+            "content": "GPT-5.6 提供三个型号。",
+        },
+        {
+            "source": "ASR",
+            "startMs": 65000,
+            "endMs": 69250,
+            "content": "应该选择能够稳定完成任务的最低推理强度。",
+        },
+    ]
+    assert calls["path"] == "demo.mp4"
+    assert calls["kwargs"]["beam_size"] == 3
+    assert calls["kwargs"]["hotwords"] == "GPT Sol Terra Luna"
+
+
+def test_paddle_ocr_content_filters_low_confidence_and_short_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PADDLEOCR_MIN_TEXT_LENGTH", "2")
+    payload = {
+        "res": {
+            "rec_texts": [" GPT-5.6 Sol ", "x", "低置信度", "每100万输入Token 5美元"],
+            "rec_scores": [0.98, 0.99, 0.42, 0.91],
+        }
+    }
+
+    assert ocr_runner.paddle_ocr_content(payload, 0.65) == "GPT-5.6 Sol 每100万输入Token 5美元"
+
+
+def test_paddle_ocr_runs_in_isolated_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> types.SimpleNamespace:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        output = Path(command[command.index("--output") + 1])
+        output.write_text(json.dumps({
+            "frameCount": 1,
+            "results": [{"index": 0, "frame": "frame-000001.jpg", "content": "SeeIt AI"}],
+            "errors": [],
+            "modelLoadMs": 100,
+            "elapsedMs": 200,
+        }), encoding="utf-8")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    payload = main.run_paddle_ocr_frames(TEST_ROOT)
+
+    assert captured["command"][1:3] == ["-m", "seeit.ocr_runner"]
+    assert captured["kwargs"]["timeout"] == 600
+    assert payload["results"][0]["content"] == "SeeIt AI"
+
+
+def test_deepseek_payload_uses_thinking_mode_and_standard_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": None, "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "get_video_metadata", "arguments": "{}"},
+            }]}}]}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setenv("AI_THINKING_MODE", "disabled")
+    monkeypatch.setenv("AI_REQUEST_TIMEOUT_SECONDS", "180")
+    monkeypatch.setattr(main.httpx, "post", fake_post)
+    provider = main.OpenAICompatibleProvider(
+        "https://api.deepseek.com",
+        "test-key",
+        "deepseek-v4-flash",
+    )
+
+    message = provider._completion(
+        [{"role": "user", "content": "读取视频元数据"}],
+        [{"type": "function", "function": {
+            "name": "get_video_metadata",
+            "description": "读取视频元数据",
+            "parameters": {"type": "object", "properties": {}},
+        }}],
+    )
+
+    assert captured["url"] == "https://api.deepseek.com/chat/completions"
+    assert captured["json"]["model"] == "deepseek-v4-flash"
+    assert captured["json"]["thinking"] == {"type": "disabled"}
+    assert captured["json"]["tool_choice"] == "auto"
+    assert message["tool_calls"][0]["function"]["name"] == "get_video_metadata"
+
+
+def test_report_normalization_does_not_split_string_fields_into_characters() -> None:
+    result = main.normalize_analysis_result({
+        "title": "模型总结",
+        "conclusions": "GPT-5.6 包含多个型号。",
+        "evidence": {
+            "timestampMs": 5000,
+            "source": "ASR",
+            "content": "GPT-5.6 包含多个型号。",
+        },
+        "suggestions": "1. 简单任务使用较低推理强度。\n2. 复杂任务再逐步提高。",
+    })
+
+    assert result["conclusions"] == ["GPT-5.6 包含多个型号。"]
+    assert result["suggestions"] == ["简单任务使用较低推理强度。", "复杂任务再逐步提高。"]
+    assert result["evidence"][0]["timestampMs"] == 5000
+
+
+def test_system_placeholder_is_refreshed_when_local_asr_becomes_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TestClient(main.app) as client:
+        headers = register(client, "asrrefresh")
+        media_id = upload(client, headers, b"video-needing-asr")
+
+        monkeypatch.setenv("LOCAL_ASR_ENABLED", "false")
+        with main.SessionLocal() as db:
+            media = db.get(main.Media, media_id)
+            placeholder = main.ensure_media_evidence(db, media)
+            db.commit()
+            assert [item["source"] for item in placeholder] == ["SYSTEM"]
+
+        monkeypatch.setenv("LOCAL_ASR_ENABLED", "true")
+        monkeypatch.setattr(main, "request_local_asr", lambda _path: [{
+            "source": "ASR",
+            "startMs": 1000,
+            "endMs": 4000,
+            "content": "真实语音转写证据",
+        }])
+        with main.SessionLocal() as db:
+            media = db.get(main.Media, media_id)
+            refreshed = main.ensure_media_evidence(db, media)
+            db.commit()
+
+        assert [item["source"] for item in refreshed] == ["ASR"]
+        assert refreshed[0]["content"] == "真实语音转写证据"
+
+
+def test_mock_provider_samples_evidence_across_the_full_timeline() -> None:
+    lines = [
+        "[0-5000ms][ASR] GPT-5.6 包含 Sol、Terra 和 Luna 三个型号。",
+        "[60000-65000ms][ASR] 价格按每百万 Token 的输入和输出分别定价。",
+        "[120000-125000ms][ASR] 推理强度包含 None、Low、Medium、High、X-High 和 Max。",
+        "[180000-185000ms][ASR] 简单任务适合 Luna，复杂专业任务适合 Sol。",
+        "[210000-215000ms][ASR] 轻量代码任务可以从 Luna 开始测试。",
+        "[240000-245000ms][ASR] 最终建议是使用能够稳定完成任务的最低推理强度，不要默认拉满。",
+    ]
+
+    result = main.MockProvider().analyze(
+        "\n".join(lines),
+        "总结 GPT-5.6 的型号、推理强度、价格、适用场景和最终建议",
+    )
+
+    timestamps = [item["timestampMs"] for item in result["evidence"]]
+    assert timestamps == [0, 60000, 120000, 180000, 210000, 240000]
+    assert max(timestamps) - min(timestamps) == 240000
+    conclusions = "\n".join(result["conclusions"])
+    assert all(f"{label}：" in conclusions for label in ["型号", "推理强度", "价格", "适用场景", "建议"])
+    assert "建议：最终建议是使用能够稳定完成任务的最低推理强度" in conclusions
 
 
 def test_rocketmq_producer_uses_supported_nameserver_api(monkeypatch: pytest.MonkeyPatch) -> None:

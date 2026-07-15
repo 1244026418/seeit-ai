@@ -55,6 +55,11 @@ services:
       AUTO_CREATE_SCHEMA: "false"
       UPLOAD_ROOT: /data/uploads
       CORS_ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.deepseek.com}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-deepseek-v4-flash}
+      AI_THINKING_MODE: ${AI_THINKING_MODE:-disabled}
+      AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-180}
     volumes:
       - seeit_uploads:/data/uploads
     depends_on:
@@ -73,14 +78,45 @@ services:
   worker:
     build: ./backend
     command: python -m seeit.worker
-    environment: *app_environment
+    environment:
+      <<: *app_environment
+      LOCAL_ASR_ENABLED: "true"
+      LOCAL_ASR_MODEL: base
+      LOCAL_ASR_MODEL_ROOT: /data/models
+      LOCAL_ASR_DEVICE: cpu
+      LOCAL_ASR_COMPUTE_TYPE: int8
+      LOCAL_ASR_CPU_THREADS: "4"
+      LOCAL_ASR_LANGUAGE: zh
+      LOCAL_ASR_BEAM_SIZE: "5"
+      LOCAL_ASR_VAD_FILTER: "true"
+      LOCAL_ASR_PRELOAD: "true"
+      LOCAL_ASR_RELEASE_BEFORE_OCR: "true"
+      LOCAL_ASR_INITIAL_PROMPT: 以下是中文技术视频的逐字稿，涉及 GPT、Sol、Terra、Luna、Reasoning Effort、Token 和 API。请使用自然标点。
+      LOCAL_ASR_HOTWORDS: ""
+      OCR_ENABLED: "true"
+      OCR_INTERVAL_SECONDS: "30"
+      PADDLEOCR_MODEL_ROOT: /data/models/paddlex
+      PADDLEOCR_MODEL_SOURCE: bos
+      PADDLEOCR_DETECTION_MODEL: PP-OCRv5_mobile_det
+      PADDLEOCR_RECOGNITION_MODEL: PP-OCRv5_mobile_rec
+      PADDLEOCR_DEVICE: cpu
+      PADDLEOCR_CPU_THREADS: "4"
+      PADDLEOCR_ENABLE_MKLDNN: "true"
+      PADDLEOCR_CONFIDENCE_THRESHOLD: "0.65"
+      PADDLEOCR_DEDUP_THRESHOLD: "0.88"
+      PADDLEOCR_MIN_TEXT_LENGTH: "2"
+      PADDLEOCR_MAX_FRAMES: "20"
+      PADDLEOCR_FRAME_MAX_WIDTH: "960"
+      PADDLEOCR_PROCESS_TIMEOUT_SECONDS: "600"
     volumes:
       - seeit_uploads:/data/uploads
+      - seeit_models:/data/models
     depends_on:
       api:
         condition: service_healthy
       rmqbroker:
         condition: service_started
+    mem_limit: 2560m
 
   mcp:
     build: ./backend
@@ -98,3 +134,4 @@ services:
 volumes:
   seeit_mysql:
   seeit_uploads:
+  seeit_models:

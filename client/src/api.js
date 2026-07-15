@@ -15,14 +15,28 @@ export function clearAuthToken() {
 }
 
 export async function apiRequest(path, options = {}) {
-  const headers = new Headers(options.headers || {})
+  const { timeoutMs = 0, ...fetchOptions } = options
+  const headers = new Headers(fetchOptions.headers || {})
   const token = localStorage.getItem(TOKEN_KEY)
   if (token) headers.set('Authorization', `Bearer ${token}`)
 
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
-  if (response.status === 401 && !path.startsWith('/user/')) {
-    clearAuthToken()
-    window.dispatchEvent(new Event('auth-expired'))
+  const controller = timeoutMs > 0 && !fetchOptions.signal ? new AbortController() : null
+  const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...fetchOptions,
+      headers,
+      signal: controller?.signal || fetchOptions.signal
+    })
+    if (response.status === 401 && !path.startsWith('/user/')) {
+      clearAuthToken()
+      window.dispatchEvent(new Event('auth-expired'))
+    }
+    return response
+  } catch (error) {
+    if (controller?.signal.aborted) throw new Error(`请求超过 ${Math.ceil(timeoutMs / 1000)} 秒未响应`)
+    throw error
+  } finally {
+    if (timeout) clearTimeout(timeout)
   }
-  return response
 }

@@ -1,6 +1,6 @@
 # SeeIt AI 服务器部署
 
-这套配置面向一台 `2 核 8 GB` 的 Ubuntu 云服务器，使用 Docker Compose 运行 MySQL、Redis、RocketMQ、FastAPI、Worker、SeeIt MCP Server、Vue/Nginx 和 Caddy。
+这套配置面向一台 `4 核 8 GB` 的 Ubuntu 云服务器，使用 Docker Compose 运行 MySQL、Redis、RocketMQ、FastAPI、Worker、SeeIt MCP Server、Vue/Nginx 和 Caddy。`2 核 8 GB` 可以运行单用户演示，但本地 ASR 会更慢。
 
 ## 1. 服务器准备
 
@@ -31,8 +31,10 @@ openssl rand -hex 32
 - 为 `MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`REDIS_PASSWORD` 和 `JWT_SECRET` 生成不同的随机值。
 - `DATABASE_URL` 中的 MySQL 用户和密码必须与上面的变量一致。
 - `CORS_ALLOWED_ORIGINS` 改成 `https://你的域名`。
-- 填写 `AI_BASE_URL`、`AI_API_KEY`、`AI_MODEL`；没有模型密钥时可以留空，使用 Mock Provider。
-- `OCR_ENABLED` 默认关闭。2 核服务器建议先关闭，避免 OCR 和视频分析同时占满 CPU。
+- DeepSeek 使用 `AI_BASE_URL=https://api.deepseek.com`、`AI_MODEL=deepseek-v4-flash`；只在服务器私有环境文件中填写新生成的 `AI_API_KEY`。密钥为空时使用 Mock Provider。
+- `LOCAL_ASR_ENABLED=true` 默认在 Worker 中启用 `faster-whisper base/int8`。首次启动会下载约 141 MB 模型到独立 Docker volume，之后复用缓存；模型不会加载到 API 或 MCP。
+- `OCR_ENABLED=true` 默认启用 PaddleOCR `PP-OCRv5_mobile_det/rec`，首次运行下载约 21 MB 模型。ASR 完成后释放 Whisper 模型，再由独立 OCR 子进程执行推理。
+- 4 核 8 GB 建议保持 `LOCAL_ASR_CPU_THREADS=4`、`WORKER_CPU_LIMIT=3.0`、`WORKER_MEMORY_LIMIT=2560m`。2 核机器建议将 CPU limit 改为 `1.5`，并可关闭 OCR 以缩短等待时间。
 - `BILIBILI_IMPORT_ENABLED=true` 时允许通过 BV 号导入公开单视频；默认限制 10 分钟、512 MB、最多重试 3 次。
 
 大陆服务器访问官方依赖源不稳定时，可以只在生产环境文件中覆盖构建镜像源：
@@ -105,15 +107,18 @@ chmod +x deploy/backup-mysql.sh
 
 脚本会把 MySQL 备份写入项目的 `backups/` 目录，并自动保留最近 7 天。上传视频位于 Docker volume，正式环境还应定期创建云盘快照；演示项目可以设置较短的文件保留周期。
 
-## 6. 2 核 8 GB 资源建议
+## 6. 本地 ASR/OCR 资源建议
 
 - API 只运行 1 个 Uvicorn 进程。
 - Worker 消费线程数设置为 1，任务串行处理。
-- 2 核服务器保持 `WORKER_CPU_LIMIT=1.0`；4 核 8 GB 服务器可设置为 `2.0`，让单个 FFmpeg/导入任务使用更多 CPU，但仍建议保持单线程消费。
+- 4 核 8 GB 服务器使用 `WORKER_CPU_LIMIT=3.0`，为 API、数据库和消息队列保留约 1 核；2 核服务器使用 `1.0` 到 `1.5`。
+- Worker 内存上限为 2560 MiB。本地 5 分 46 秒、1080p 中文技术视频实测 Worker 总处理 98.97 秒，其中 base ASR 43.64 秒、12 帧 PaddleOCR 子进程 44.37 秒；采样峰值约 1321 MiB，距上限仍有约 1239 MiB 余量。
+- OCR 默认每 30 秒采样一帧、最长 20 帧、最大宽度 960 像素。该配置面向单用户演示，若更重视小字识别可提高宽度或采样频率，但必须重新测试耗时和内存。
 - MySQL buffer pool 为 256 MB，Redis 上限为 192 MB。
 - RocketMQ NameServer/Broker 已限制 JVM 堆内存。
 - 单个视频默认不超过 512 MB、时长不超过 10 分钟。
-- 如果服务器内存持续超过 80%，先关闭 OCR、减少日志和清理历史上传，再考虑升级机器。
+- 首次模型下载期间查看 Worker 日志；若 Hugging Face 网络不稳定，可在可信网络预下载同一模型并复制到 `seeit_prod_models` volume。
+- 如果服务器内存持续超过 80%，先关闭 OCR、降低抽帧数量、减少日志和清理历史上传，再考虑升级机器。
 
 ## 7. 常用排错
 
