@@ -15,6 +15,6 @@ mkdir -p "$BACKUP_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 TARGET="$BACKUP_DIR/mysql-$STAMP.sql.gz"
 
-"${COMPOSE[@]}" exec -T mysql sh -c 'exec mysqldump --single-transaction --quick -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' | gzip > "$TARGET"
+"${COMPOSE[@]}" exec -T mysql sh -c 'exec mysqldump --single-transaction --quick --no-tablespaces -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' | gzip > "$TARGET"
 find "$BACKUP_DIR" -type f -name 'mysql-*.sql.gz' -mtime +7 -delete
 echo "MySQL 备份已生成：$TARGET"
