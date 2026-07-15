@@ -60,7 +60,11 @@ def run(input_dir: Path) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    frames = sorted(input_dir.glob("frame-*.jpg"))
+    frames = sorted(
+        frame
+        for pattern in ("frame-*.png", "frame-*.jpg", "frame-*.jpeg")
+        for frame in input_dir.glob(pattern)
+    )
     for index, frame in enumerate(frames):
         try:
             predictions = model.predict(

@@ -312,6 +312,32 @@ def test_paddle_ocr_content_filters_low_confidence_and_short_text(
     assert ocr_runner.paddle_ocr_content(payload, 0.65) == "GPT-5.6 Sol 每100万输入Token 5美元"
 
 
+def test_ocr_runner_reads_png_and_jpeg_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame_dir = TEST_ROOT / "ocr-frame-formats"
+    shutil.rmtree(frame_dir, ignore_errors=True)
+    frame_dir.mkdir(parents=True)
+    (frame_dir / "frame-000001.png").write_bytes(b"png")
+    (frame_dir / "frame-000002.jpg").write_bytes(b"jpg")
+    (frame_dir / "ignored.txt").write_text("ignored", encoding="utf-8")
+
+    class FakePaddleOCR:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def predict(self, path: str, **_: object) -> list[dict]:
+            return [{"res": {"rec_texts": [Path(path).name], "rec_scores": [0.99]}}]
+
+    fake_module = types.ModuleType("paddleocr")
+    fake_module.PaddleOCR = FakePaddleOCR
+    monkeypatch.setitem(sys.modules, "paddleocr", fake_module)
+    monkeypatch.setenv("PADDLEOCR_MODEL_ROOT", str(TEST_ROOT / "paddlex-models"))
+
+    payload = ocr_runner.run(frame_dir)
+
+    assert payload["frameCount"] == 2
+    assert [item["frame"] for item in payload["results"]] == ["frame-000001.png", "frame-000002.jpg"]
+
+
 def test_paddle_ocr_runs_in_isolated_process(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
