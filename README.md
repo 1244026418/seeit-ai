@@ -116,7 +116,7 @@ cd backend
 pytest -q
 ```
 
-当前 26 项测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、排队看门狗、失败重试、Agent 工具调用 Trace、DeepSeek 标准 `tool_calls`、模型输出容错、证据检索/窗口/引用校验、真实 ASR 时间戳适配、PaddleOCR 结果过滤与进程隔离、旧 SYSTEM 占位证据刷新、全片分主题采样、MCP 工具和资源注册、匿名请求拒绝、反馈持久化、JWT 撤销、生产配置校验、FFprobe 视频校验、RocketMQ 客户端契约，以及 BV 校验、预览时长限制、导入幂等和媒体来源入库。
+当前 28 项测试覆盖：注册、鉴权隔离、浏览器 multipart 分片上传、断点查询、内容去重、分析幂等、排队看门狗、失败重试、Agent 工具调用 Trace、DeepSeek 标准 `tool_calls`、模型输出容错、证据检索/窗口/引用校验、真实 ASR 时间戳适配、PaddleOCR 结果过滤与进程隔离、FFmpeg 7 短视频首帧抽取、PNG/JPEG OCR 帧扫描、旧 SYSTEM 占位证据刷新、全片分主题采样、MCP 工具和资源注册、匿名请求拒绝、反馈持久化、JWT 撤销、生产配置校验、FFprobe 视频校验、RocketMQ 客户端契约，以及 BV 校验、预览时长限制、导入幂等和媒体来源入库。
 
 ## 服务器部署
 
