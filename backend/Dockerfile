@@ -33,7 +33,7 @@ RUN set -eux; \
     test "$installed" = 1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin seeit \
-    && mkdir -p /data/uploads \
+    && mkdir -p /data/uploads /data/models \
     && chown -R seeit:seeit /data
 
 ARG ROCKETMQ_CLIENT_VERSION=2.0.0
