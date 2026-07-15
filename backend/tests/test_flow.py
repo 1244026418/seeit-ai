@@ -336,6 +336,32 @@ def test_paddle_ocr_runs_in_isolated_process(monkeypatch: pytest.MonkeyPatch) ->
     assert payload["results"][0]["content"] == "SeeIt AI"
 
 
+def test_ocr_sampling_always_selects_the_first_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **_: object) -> types.SimpleNamespace:
+        captured["command"] = command
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("OCR_ENABLED", "true")
+    monkeypatch.setenv("OCR_INTERVAL_SECONDS", "30")
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main, "release_local_asr_model", lambda: None)
+    monkeypatch.setattr(main, "run_paddle_ocr_frames", lambda _directory: {
+        "frameCount": 1,
+        "results": [{"index": 0, "content": "SeeIt AI"}],
+        "errors": [],
+    })
+
+    segments = main.extract_ocr_evidence(TEST_ROOT / "short-video.mp4")
+    command = captured["command"]
+
+    assert "select='isnan(prev_selected_t)+gte(t-prev_selected_t,30)'" in command[command.index("-vf") + 1]
+    assert command[command.index("-fps_mode") + 1] == "vfr"
+    assert command[-1].endswith(".png")
+    assert segments[0]["content"] == "SeeIt AI"
+
+
 def test_deepseek_payload_uses_thinking_mode_and_standard_tool_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

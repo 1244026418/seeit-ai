@@ -829,7 +829,11 @@ def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
     temp_root = UPLOAD_ROOT / "tmp"
     temp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ocr-", dir=temp_root) as directory:
-        frame_pattern = str(Path(directory) / "frame-%06d.jpg")
+        frame_pattern = str(Path(directory) / "frame-%06d.png")
+        frame_filter = (
+            f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval_seconds})',"
+            f"scale='min({max_width},iw)':-2"
+        )
         subprocess.run(
             [
                 "ffmpeg",
@@ -837,11 +841,11 @@ def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
                 "-i",
                 str(path),
                 "-vf",
-                f"fps=1/{interval_seconds},scale='min({max_width},iw)':-2",
+                frame_filter,
+                "-fps_mode",
+                "vfr",
                 "-frames:v",
                 str(max_frames),
-                "-q:v",
-                "3",
                 frame_pattern,
             ],
             check=True,
