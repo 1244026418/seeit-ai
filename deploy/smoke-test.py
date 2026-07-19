@@ -202,6 +202,12 @@ def main() -> None:
                 ),
                 200,
             )
+            memory = require(
+                client.get("/analysis/agent-memory", params={"id": media_id}, headers=headers),
+                200,
+            )
+            if int(memory.get("messageCount", 0)) < 2:
+                raise RuntimeError(f"Agent 短期记忆未持久化追问: {memory}")
             media_list = require(client.get("/media/list", headers=headers), 200)
 
             result.update(
@@ -210,6 +216,7 @@ def main() -> None:
                 evaluation=evaluation,
                 feedback=feedback,
                 followUpChars=len(follow_up),
+                memoryMessageCount=memory.get("messageCount", 0),
                 mediaVisible=any(item["id"] == media_id for item in media_list),
             )
         finally:

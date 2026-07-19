@@ -58,7 +58,9 @@ def upload(client: TestClient, headers: dict[str, str], content: bytes, filename
 
 
 @pytest.fixture(autouse=True)
-def reset_database() -> None:
+def reset_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("AI_BASE_URL", "AI_API_KEY", "AI_MODEL"):
+        monkeypatch.delenv(variable, raising=False)
     main.Base.metadata.drop_all(main.engine)
     main.Base.metadata.create_all(main.engine)
     shutil.rmtree(main.UPLOAD_ROOT, ignore_errors=True)
@@ -611,12 +613,88 @@ def test_openai_compatible_provider_executes_model_tool_calls(monkeypatch: pytes
     result = provider.run_agent(toolbox, "整理数据库索引操作")
 
     assert result["accepted"] is True
+    assert result["agentGraph"]["framework"] == "LangGraph"
+    assert result["agentGraph"]["intent"] == "OPERATION_GUIDE"
+    assert result["agentGraph"]["steps"] == 3
     assert [item["tool"] for item in toolbox.trace()] == [
         "get_video_metadata",
         "search_timeline",
         "get_evidence_window",
         "generate_report",
     ]
+
+
+def test_langgraph_revises_report_after_critic_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    toolbox = main.AgentToolbox(
+        metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
+        segments=[{
+            "segmentId": 1,
+            "source": "ASR",
+            "startMs": 5000,
+            "endMs": 9000,
+            "content": "首先创建数据库索引。",
+        }],
+        normalize_report=main.normalize_analysis_result,
+        evaluate_report=main.evaluate_result,
+    )
+    reports = iter([
+        {"content": None, "tool_calls": [{
+            "id": "rejected-report",
+            "function": {"name": "generate_report", "arguments": json.dumps({
+                "title": "第一次报告",
+                "conclusions": ["视频介绍数据库索引。"],
+                "evidence": [{"timestampMs": 99999, "source": "ASR", "content": "不存在的证据"}],
+                "suggestions": [],
+            }, ensure_ascii=False)},
+        }]},
+        {"content": None, "tool_calls": [{
+            "id": "accepted-report",
+            "function": {"name": "generate_report", "arguments": json.dumps({
+                "title": "修订后的报告",
+                "conclusions": ["视频首先要求创建数据库索引。"],
+                "evidence": [{"timestampMs": 5000, "source": "ASR", "content": "首先创建数据库索引。"}],
+                "suggestions": [],
+            }, ensure_ascii=False)},
+        }]},
+    ])
+    provider = main.OpenAICompatibleProvider("https://example.com/v1", "test-key", "test-model")
+    monkeypatch.setattr(provider, "_completion", lambda messages, tools=None: next(reports))
+
+    result = provider.run_agent(toolbox, "整理数据库索引操作")
+
+    assert result["accepted"] is True
+    assert result["report"]["title"] == "修订后的报告"
+    assert result["agentGraph"]["steps"] == 2
+    assert [item["resultPreview"].find('"accepted":false') >= 0 for item in toolbox.trace()] == [True, False]
+
+
+def test_langgraph_does_not_return_report_rejected_at_step_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    toolbox = main.AgentToolbox(
+        metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
+        segments=[],
+        normalize_report=main.normalize_analysis_result,
+        evaluate_report=main.evaluate_result,
+    )
+    rejected = {
+        "content": None,
+        "tool_calls": [{
+            "id": "rejected-report",
+            "function": {"name": "generate_report", "arguments": json.dumps({
+                "title": "无证据报告",
+                "conclusions": ["缺少可验证证据。"],
+                "evidence": [],
+                "suggestions": [],
+            }, ensure_ascii=False)},
+        }],
+    }
+    provider = main.OpenAICompatibleProvider("https://example.com/v1", "test-key", "test-model")
+    monkeypatch.setenv("AGENT_MAX_TOOL_STEPS", "3")
+    monkeypatch.setattr(provider, "_completion", lambda messages, tools=None: rejected)
+
+    with pytest.raises(RuntimeError, match="未通过 Critic 校验"):
+        provider.run_agent(toolbox, "总结视频")
 
 
 def test_chunk_size_and_authentication_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -648,6 +726,109 @@ def test_logout_revokes_token_when_redis_is_available(monkeypatch: pytest.Monkey
         monkeypatch.setattr(main, "redis_client", lambda: fake_redis)
         assert client.post("/user/logout", headers=headers).status_code == 200
         assert client.get("/media/list", headers=headers).status_code == 401
+
+
+def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_history_lengths: list[int] = []
+
+    class RememberingProvider(main.Provider):
+        def analyze(self, transcript: str, goal: str) -> dict:
+            return {}
+
+        def follow_up(
+            self,
+            report: str,
+            question: str,
+            *,
+            history: list[dict[str, str]] | None = None,
+            memory_summary: str = "",
+        ) -> str:
+            captured_history_lengths.append(len(history or []))
+            return f"回答：{question}；历史消息={len(history or [])}"
+
+    monkeypatch.setattr(main, "provider", lambda: RememberingProvider())
+
+    with TestClient(main.app) as client:
+        owner = register(client, "memown")
+        other = register(client, "memoth")
+        media_id = upload(client, owner, b"memory-video")
+        with main.SessionLocal() as db:
+            media = db.get(main.Media, media_id)
+            media.ai_summary = "报告说明数据库索引可以避免重复数据。"
+            db.commit()
+
+        first = client.post(
+            "/analysis/follow-up",
+            params={"id": media_id, "question": "索引有什么作用？"},
+            headers=owner,
+        )
+        second = client.post(
+            "/analysis/follow-up",
+            params={"id": media_id, "question": "刚才的结论对应什么场景？"},
+            headers=owner,
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert captured_history_lengths == [0, 2]
+        memory = client.get("/analysis/agent-memory", params={"id": media_id}, headers=owner).json()
+        assert memory["sessionId"]
+        assert memory["messageCount"] == 4
+        assert memory["sessionCount"] == 1
+        assert len(memory["sessions"]) == 1
+        assert memory["sessions"][0]["historyTruncated"] is False
+        assert [item["role"] for item in memory["messages"]] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert "索引有什么作用" in memory["summary"]
+
+        with main.SessionLocal() as db:
+            second_goal = "从另一个分析目标继续追问"
+            media = db.get(main.Media, media_id)
+            second_session = main.AgentSession(
+                id=str(main.uuid.uuid4()),
+                user_id=media.user_id,
+                media_id=media_id,
+                goal=second_goal,
+                goal_hash=main.hashlib.sha256(second_goal.encode("utf-8")).hexdigest(),
+                updated_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+            )
+            db.add(second_session)
+            db.flush()
+            db.add_all([
+                main.AgentMessage(
+                    session_id=second_session.id,
+                    user_id=media.user_id,
+                    role="user",
+                    content="第二个会话的问题",
+                ),
+                main.AgentMessage(
+                    session_id=second_session.id,
+                    user_id=media.user_id,
+                    role="assistant",
+                    content="第二个会话的回答",
+                ),
+            ])
+            db.commit()
+
+        memory = client.get("/analysis/agent-memory", params={"id": media_id}, headers=owner).json()
+        assert memory["sessionCount"] == 2
+        assert memory["goal"] == "从另一个分析目标继续追问"
+        assert sum(item["messageCount"] for item in memory["sessions"]) == 6
+        media_card = client.get("/media/list", headers=owner).json()[0]
+        assert media_card["hasAnalysisReport"] is True
+        assert media_card["agentSessionCount"] == 2
+        assert media_card["agentMessageCount"] == 6
+        assert media_card["agentLastMessage"] == "第二个会话的回答"
+        assert client.get("/analysis/agent-memory", params={"id": media_id}, headers=other).status_code == 404
+
+        assert client.delete("/media/delete", params={"id": media_id}, headers=owner).status_code == 200
+        with main.SessionLocal() as db:
+            assert db.scalar(main.select(main.AgentSession)) is None
+            assert db.scalar(main.select(main.AgentMessage)) is None
 
 
 def test_production_mode_rejects_unsafe_configuration(monkeypatch: pytest.MonkeyPatch) -> None:

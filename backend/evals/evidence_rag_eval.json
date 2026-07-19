@@ -1,0 +1,27 @@
+{
+  "description": "合成 ASR/OCR 证据检索基线；用于验证检索实现和指标脚本，不代表真实视频准确率。",
+  "topK": 3,
+  "segments": [
+    {"segmentId": "s1", "source": "ASR", "startMs": 0, "endMs": 5000, "content": "本节课程介绍 MySQL 数据库表设计和基础查询。"},
+    {"segmentId": "s2", "source": "ASR", "startMs": 10000, "endMs": 16000, "content": "首先为用户表的 username 字段创建唯一索引，避免重复数据。"},
+    {"segmentId": "s3", "source": "ASR", "startMs": 22000, "endMs": 29000, "content": "事务失败时执行 rollback 回滚，保证订单和库存修改的一致性。"},
+    {"segmentId": "s4", "source": "ASR", "startMs": 36000, "endMs": 43000, "content": "会议决定本周五发布新版本，由张同学负责部署。"},
+    {"segmentId": "s5", "source": "ASR", "startMs": 45000, "endMs": 52000, "content": "待办事项是补充接口测试，负责人是李同学，截止时间为周四。"},
+    {"segmentId": "s6", "source": "ASR", "startMs": 58000, "endMs": 65000, "content": "当前风险是第三方模型接口限流，可能阻塞线上演示。"},
+    {"segmentId": "s7", "source": "ASR", "startMs": 70000, "endMs": 77000, "content": "操作步骤一是打开系统设置，然后进入模型供应商页面。"},
+    {"segmentId": "s8", "source": "ASR", "startMs": 82000, "endMs": 89000, "content": "在终端运行 docker compose up 命令启动全部服务。"},
+    {"segmentId": "s9", "source": "ASR", "startMs": 94000, "endMs": 101000, "content": "模型价格按照每百万 Token 的输入和输出分别计费。"},
+    {"segmentId": "s10", "source": "OCR", "startMs": 108000, "endMs": 108000, "content": "页面按钮文字：提交分析任务"}
+  ],
+  "cases": [
+    {"id": "database-index", "query": "用户表唯一索引", "expectedSegmentIds": ["s2"], "sources": ["ASR"]},
+    {"id": "transaction-rollback", "query": "事务失败如何回滚", "expectedSegmentIds": ["s3"], "sources": ["ASR"]},
+    {"id": "meeting-decision", "query": "会议决定什么时候发布", "expectedSegmentIds": ["s4"], "sources": ["ASR"]},
+    {"id": "meeting-action", "query": "接口测试待办负责人和截止时间", "expectedSegmentIds": ["s5"], "sources": ["ASR"]},
+    {"id": "meeting-risk", "query": "模型限流风险和阻塞", "expectedSegmentIds": ["s6"], "sources": ["ASR"]},
+    {"id": "operation-settings", "query": "如何进入模型供应商设置", "expectedSegmentIds": ["s7"], "sources": ["ASR"]},
+    {"id": "docker-command", "query": "docker compose 启动服务命令", "expectedSegmentIds": ["s8"], "sources": ["ASR"]},
+    {"id": "model-price", "query": "每百万 Token 输入输出价格", "expectedSegmentIds": ["s9"], "sources": ["ASR"]},
+    {"id": "ocr-submit", "query": "提交分析任务按钮", "expectedSegmentIds": ["s10"], "sources": ["OCR"]}
+  ]
+}

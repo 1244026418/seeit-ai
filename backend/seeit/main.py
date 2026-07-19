@@ -28,12 +28,13 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete, select, update
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, delete, func, select, update
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from seeit.agent import AgentToolbox, build_agent_plan
+from seeit.agent_graph import run_langgraph_agent
 from seeit.bilibili import (
     BilibiliImportError,
     download_bilibili_video,
@@ -196,6 +197,33 @@ class AnalysisFeedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class AgentSession(Base):
+    __tablename__ = "agent_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "media_id", "goal_hash", name="uq_agent_session_scope"),
+        Index("ix_agent_session_user_updated", "user_id", "updated_at"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    media_id: Mapped[int] = mapped_column(ForeignKey("media_files.id"), index=True)
+    goal: Mapped[str] = mapped_column(String(500))
+    goal_hash: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class AgentMessage(Base):
+    __tablename__ = "agent_messages"
+    __table_args__ = (Index("ix_agent_message_session_created", "session_id", "created_at"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class AuthRequest(BaseModel):
     username: str
     password: str
@@ -248,7 +276,14 @@ class Provider:
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         raise NotImplementedError
 
-    def follow_up(self, report: str, question: str) -> str:
+    def follow_up(
+        self,
+        report: str,
+        question: str,
+        *,
+        history: Optional[list[dict[str, str]]] = None,
+        memory_summary: str = "",
+    ) -> str:
         raise NotImplementedError
 
     def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
@@ -362,12 +397,21 @@ class MockProvider(Provider):
             "suggestions": ["若需更强的归纳与追问能力，请配置真实 LLM Provider；当前报告为可复现的抽取式摘要。"],
         }
 
-    def follow_up(self, report: str, question: str) -> str:
-        return f"## 追问结果\n\n问题：{question}\n\n基于当前报告：\n\n{report[:3000]}"
+    def follow_up(
+        self,
+        report: str,
+        question: str,
+        *,
+        history: Optional[list[dict[str, str]]] = None,
+        memory_summary: str = "",
+    ) -> str:
+        turn_count = len(history or []) // 2
+        memory_note = f"，并参考了此前 {turn_count} 轮追问" if turn_count else ""
+        return f"## 追问结果\n\n问题：{question}\n\n基于当前报告{memory_note}：\n\n{report[:3000]}"
 
 
 class OpenAICompatibleProvider(Provider):
-    agent_mode = "MODEL_TOOL_CALLING"
+    agent_mode = "MODEL_TOOL_CALLING_LANGGRAPH"
 
     def __init__(self, base_url: str, api_key: str, model: str):
         self.url = base_url.rstrip("/") + "/chat/completions"
@@ -416,73 +460,35 @@ class OpenAICompatibleProvider(Provider):
             raise ValueError("模型未返回合法 JSON 对象")
         return json.loads(raw[start : end + 1])
 
-    def follow_up(self, report: str, question: str) -> str:
-        return self._chat(f"根据报告回答问题，不要编造事实。\n报告：{report}\n问题：{question}")
+    def follow_up(
+        self,
+        report: str,
+        question: str,
+        *,
+        history: Optional[list[dict[str, str]]] = None,
+        memory_summary: str = "",
+    ) -> str:
+        messages: list[dict[str, Any]] = [{
+            "role": "system",
+            "content": (
+                "你是 SeeIt AI 的多轮视频问答 Agent。只能根据已有报告和对话中出现的证据回答；"
+                "信息不足时明确说明，不得编造视频内容或时间戳。"
+            ),
+        }, {
+            "role": "user",
+            "content": f"视频分析报告：\n{report[:12000]}\n\n历史记忆摘要：\n{memory_summary[:4000]}",
+        }]
+        for item in (history or [])[-20:]:
+            role = str(item.get("role") or "").lower()
+            if role in {"user", "assistant"}:
+                messages.append({"role": role, "content": str(item.get("content") or "")[:4000]})
+        messages.append({"role": "user", "content": question})
+        message = self._completion(messages)
+        return str(message.get("content") or "").strip()
 
     def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "你是 SeeIt AI 的视频证据 Agent。必须先调用工具读取和检索视频，"
-                    "只根据工具返回的 ASR/OCR 证据回答。不得编造时间戳或视频事实。"
-                    "完成后调用 generate_report；如果 Critic 未通过，继续检索并修订。"
-                ),
-            },
-            {"role": "user", "content": f"分析目标：{goal}"},
-        ]
-        last_report: Optional[dict[str, Any]] = None
         max_steps = max(3, min(int(env("AGENT_MAX_TOOL_STEPS", "8")), 12))
-        for _ in range(max_steps):
-            message = self._completion(messages, toolbox.tool_schemas())
-            tool_calls = message.get("tool_calls") or []
-            if not tool_calls:
-                content = str(message.get("content") or "").replace("```json", "").replace("```", "").strip()
-                start, end = content.find("{"), content.rfind("}")
-                if start >= 0 and end > start:
-                    try:
-                        candidate = json.loads(content[start : end + 1])
-                    except json.JSONDecodeError:
-                        candidate = {}
-                    generated = toolbox.execute("generate_report", candidate)
-                    if generated.get("ok"):
-                        last_report = generated
-                        if generated.get("accepted"):
-                            return generated
-                messages.append({"role": "assistant", "content": content})
-                messages.append({
-                    "role": "user",
-                    "content": "请继续调用证据工具，并通过 generate_report 提交可校验的最终报告。",
-                })
-                continue
-
-            messages.append({
-                "role": "assistant",
-                "content": message.get("content"),
-                "tool_calls": tool_calls,
-            })
-            for call in tool_calls:
-                function = call.get("function") or {}
-                name = str(function.get("name") or "")
-                raw_arguments = function.get("arguments") or "{}"
-                try:
-                    arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    arguments = {"invalid_arguments": str(raw_arguments)[:1000]}
-                result = toolbox.execute(name, arguments)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": str(call.get("id") or uuid.uuid4()),
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
-                if name == "generate_report" and result.get("ok"):
-                    last_report = result
-            if last_report and last_report.get("accepted"):
-                return last_report
-
-        if last_report:
-            return last_report
-        return super().run_agent(toolbox, goal)
+        return run_langgraph_agent(self, toolbox, goal, max_steps=max_steps)
 
 
 def provider() -> Provider:
@@ -1257,6 +1263,7 @@ def process_analysis(task_id: str) -> str:
                 "evidenceSegmentCount": len(toolbox.segments),
                 "toolCallCount": len(toolbox.trace()),
                 "toolCalls": toolbox.trace(),
+                "graph": generated.get("agentGraph"),
             }
 
             task.result = format_report(result)
@@ -1831,6 +1838,45 @@ def complete_upload(uploadId: str, user: User = Depends(current_user)) -> dict[s
 def media_list(user: User = Depends(current_user)) -> list[dict[str, Any]]:
     with SessionLocal() as db:
         rows = db.scalars(select(Media).where(Media.user_id == user.id).order_by(Media.id.desc())).all()
+        tasks = db.scalars(
+            select(AnalysisTask)
+            .where(AnalysisTask.user_id == user.id)
+            .order_by(AnalysisTask.created_at.desc())
+        ).all()
+        latest_tasks: dict[int, AnalysisTask] = {}
+        for task in tasks:
+            latest_tasks.setdefault(task.media_id, task)
+
+        sessions = db.scalars(
+            select(AgentSession)
+            .where(AgentSession.user_id == user.id)
+            .order_by(AgentSession.updated_at.desc())
+        ).all()
+        agent_stats: dict[int, dict[str, Any]] = {}
+        for session in sessions:
+            stats = agent_stats.setdefault(session.media_id, {
+                "sessionCount": 0,
+                "messageCount": 0,
+                "lastMessage": "",
+                "updatedAt": None,
+            })
+            stats["sessionCount"] += 1
+            if stats["updatedAt"] is None:
+                stats["updatedAt"] = session.updated_at.isoformat()
+        messages = db.execute(
+            select(AgentMessage, AgentSession.media_id)
+            .join(AgentSession, AgentMessage.session_id == AgentSession.id)
+            .where(AgentSession.user_id == user.id)
+            .order_by(AgentMessage.id.desc())
+        ).all()
+        for message, media_id in messages:
+            stats = agent_stats.get(media_id)
+            if not stats:
+                continue
+            stats["messageCount"] += 1
+            if not stats["lastMessage"]:
+                stats["lastMessage"] = message.content[:180]
+
         return [{
             "id": row.id,
             "filename": row.filename,
@@ -1839,6 +1885,13 @@ def media_list(user: User = Depends(current_user)) -> list[dict[str, Any]]:
             "coverUrl": row.cover_url,
             "sourceType": row.source_type,
             "sourceRef": row.source_ref,
+            "hasAnalysisReport": bool(row.ai_summary),
+            "analysisState": latest_tasks[row.id].state if row.id in latest_tasks else None,
+            "analysisGoal": latest_tasks[row.id].goal if row.id in latest_tasks else None,
+            "agentSessionCount": agent_stats.get(row.id, {}).get("sessionCount", 0),
+            "agentMessageCount": agent_stats.get(row.id, {}).get("messageCount", 0),
+            "agentLastMessage": agent_stats.get(row.id, {}).get("lastMessage", ""),
+            "agentUpdatedAt": agent_stats.get(row.id, {}).get("updatedAt"),
         } for row in rows]
 
 
@@ -1847,6 +1900,10 @@ def delete_media(id: int, user: User = Depends(current_user)) -> str:
     with SessionLocal() as db:
         media = owned_media(db, id, user)
         task_ids = list(db.scalars(select(AnalysisTask.id).where(AnalysisTask.media_id == id)).all())
+        session_ids = list(db.scalars(select(AgentSession.id).where(AgentSession.media_id == id)).all())
+        if session_ids:
+            db.execute(delete(AgentMessage).where(AgentMessage.session_id.in_(session_ids)))
+        db.execute(delete(AgentSession).where(AgentSession.media_id == id))
         if task_ids:
             db.execute(delete(AnalysisFeedback).where(AnalysisFeedback.task_id.in_(task_ids)))
         db.execute(delete(AnalysisTask).where(AnalysisTask.media_id == id))
@@ -2019,21 +2076,147 @@ def agent_verify_citations(
         return result
 
 
-@app.post("/analysis/follow-up")
-def follow_up(id: int, question: str = Query(min_length=1, max_length=500), user: User = Depends(current_user)) -> str:
-    with SessionLocal() as db:
-        media = owned_media(db, id, user)
-        if not media.ai_summary:
-            raise HTTPException(status_code=409, detail="请先完成视频分析")
-        return provider().follow_up(media.ai_summary, question.strip())
-
-
 def latest_task(db: Session, media_id: int, goal: Optional[str] = None) -> Optional[AnalysisTask]:
     statement = select(AnalysisTask).where(AnalysisTask.media_id == media_id)
     if goal is not None:
         goal_hash = hashlib.sha256(goal.strip().encode("utf-8")).hexdigest()
         statement = statement.where(AnalysisTask.goal_hash == goal_hash)
     return db.scalar(statement.order_by(AnalysisTask.created_at.desc()))
+
+
+def get_or_create_agent_session(
+    db: Session,
+    *,
+    user_id: int,
+    media_id: int,
+    goal: str,
+) -> AgentSession:
+    normalized_goal = re.sub(r"\s+", " ", goal).strip() or "基于最新报告继续追问"
+    goal_hash = hashlib.sha256(normalized_goal.encode("utf-8")).hexdigest()
+    session = db.scalar(select(AgentSession).where(
+        AgentSession.user_id == user_id,
+        AgentSession.media_id == media_id,
+        AgentSession.goal_hash == goal_hash,
+    ))
+    if session:
+        return session
+    session = AgentSession(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        media_id=media_id,
+        goal=normalized_goal,
+        goal_hash=goal_hash,
+    )
+    db.add(session)
+    db.flush()
+    return session
+
+
+def recent_agent_messages(db: Session, session_id: str) -> list[dict[str, str]]:
+    limit = max(2, min(int(env("AGENT_MEMORY_MAX_MESSAGES", "12")), 30))
+    rows = list(db.scalars(
+        select(AgentMessage)
+        .where(AgentMessage.session_id == session_id)
+        .order_by(AgentMessage.id.desc())
+        .limit(limit)
+    ).all())
+    rows.reverse()
+    return [{"role": row.role, "content": row.content} for row in rows]
+
+
+def agent_history_messages(db: Session, session_id: str) -> list[dict[str, str]]:
+    limit = max(20, min(int(env("AGENT_HISTORY_MAX_MESSAGES", "200")), 500))
+    rows = list(db.scalars(
+        select(AgentMessage)
+        .where(AgentMessage.session_id == session_id)
+        .order_by(AgentMessage.id.desc())
+        .limit(limit)
+    ).all())
+    rows.reverse()
+    return [{"role": row.role, "content": row.content} for row in rows]
+
+
+def update_agent_memory_summary(session: AgentSession, messages: list[dict[str, str]]) -> None:
+    rendered = "\n".join(
+        f"{item['role']}: {str(item['content'])[:1200]}"
+        for item in messages[-12:]
+    )
+    session.summary = rendered[-6000:]
+    session.updated_at = datetime.now(timezone.utc)
+
+
+@app.post("/analysis/follow-up")
+def follow_up(id: int, question: str = Query(min_length=1, max_length=500), user: User = Depends(current_user)) -> str:
+    with SessionLocal() as db:
+        media = owned_media(db, id, user)
+        if not media.ai_summary:
+            raise HTTPException(status_code=409, detail="请先完成视频分析")
+        task = latest_task(db, id)
+        session = get_or_create_agent_session(
+            db,
+            user_id=user.id,
+            media_id=id,
+            goal=task.goal if task else "基于最新报告继续追问",
+        )
+        history = recent_agent_messages(db, session.id)
+        answer = provider().follow_up(
+            media.ai_summary,
+            question.strip(),
+            history=history,
+            memory_summary=session.summary or "",
+        )
+        db.add_all([
+            AgentMessage(session_id=session.id, user_id=user.id, role="user", content=question.strip()),
+            AgentMessage(session_id=session.id, user_id=user.id, role="assistant", content=answer),
+        ])
+        update_agent_memory_summary(session, [
+            *history,
+            {"role": "user", "content": question.strip()},
+            {"role": "assistant", "content": answer},
+        ])
+        db.commit()
+        return answer
+
+
+@app.get("/analysis/agent-memory")
+def agent_memory(id: int, user: User = Depends(current_user)) -> dict[str, Any]:
+    with SessionLocal() as db:
+        owned_media(db, id, user)
+        sessions = list(db.scalars(
+            select(AgentSession)
+            .where(AgentSession.media_id == id, AgentSession.user_id == user.id)
+            .order_by(AgentSession.updated_at.desc())
+        ).all())
+        serialized_sessions: list[dict[str, Any]] = []
+        for session in sessions:
+            message_count = int(db.scalar(
+                select(func.count(AgentMessage.id)).where(AgentMessage.session_id == session.id)
+            ) or 0)
+            messages = agent_history_messages(db, session.id)
+            serialized_sessions.append({
+                "sessionId": session.id,
+                "goal": session.goal,
+                "summary": session.summary or "",
+                "messageCount": message_count,
+                "messages": messages,
+                "historyTruncated": message_count > len(messages),
+                "createdAt": session.created_at.isoformat(),
+                "updatedAt": session.updated_at.isoformat(),
+            })
+        latest = serialized_sessions[0] if serialized_sessions else {
+            "sessionId": None,
+            "goal": None,
+            "summary": "",
+            "messageCount": 0,
+            "messages": [],
+            "createdAt": None,
+            "updatedAt": None,
+        }
+        return {
+            **latest,
+            "sessionCount": len(serialized_sessions),
+            "sessions": serialized_sessions,
+        }
 
 
 def analysis_task_payload(task: AnalysisTask) -> dict[str, Any]:

@@ -77,7 +77,7 @@ curl https://你的域名/api/health
 
 MCP Streamable HTTP 地址为 `https://你的域名/mcp`。客户端需要使用网站登录接口签发的 JWT 作为 Bearer Token；不同用户的 Token 只能访问各自视频。不要将 Token 写入 GitHub、Skill 文件或公开截图。
 
-启动完成后可以执行一次无密钥生产冒烟。脚本会在 API 容器内生成 2 秒测试视频，依次验证注册、登录、三分片断点查询、视频校验、RocketMQ 异步分析、Agent 轨迹/评估/反馈和资源清理，并在最后输出消费者偏移与积压：
+启动完成后可以执行一次无密钥生产冒烟。脚本会在 API 容器内生成 2 秒测试视频，依次验证注册、登录、三分片断点查询、视频校验、RocketMQ 异步分析、Agent 轨迹/评估/反馈、短期记忆和资源清理，并在最后输出消费者偏移与积压：
 
 ```bash
 chmod +x deploy/smoke-production.sh

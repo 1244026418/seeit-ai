@@ -6,6 +6,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from seeit.retrieval import EvidenceRetriever
+
 
 ReportNormalizer = Callable[[dict[str, Any]], dict[str, Any]]
 ReportEvaluator = Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]]
@@ -68,6 +70,7 @@ class AgentToolbox:
     ) -> None:
         self.metadata = dict(metadata)
         self.segments = [self._public_segment(item, index) for index, item in enumerate(segments)]
+        self.retriever = EvidenceRetriever(self.segments)
         self.normalize_report = normalize_report
         self.evaluate_report = evaluate_report
         self._trace: list[dict[str, Any]] = []
@@ -89,23 +92,11 @@ class AgentToolbox:
 
     @staticmethod
     def _terms(value: str) -> set[str]:
-        normalized = re.sub(r"\s+", "", value.lower())
-        ascii_words = set(re.findall(r"[a-z0-9_]{2,}", normalized))
-        chinese = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
-        chinese_pairs = {chinese[index : index + 2] for index in range(max(0, len(chinese) - 1))}
-        return ascii_words | chinese_pairs
+        return EvidenceRetriever.terms(value)
 
     @classmethod
     def _relevance(cls, query: str, content: str) -> float:
-        compact_query = re.sub(r"\s+", "", query.lower())
-        compact_content = re.sub(r"\s+", "", content.lower())
-        if not compact_query or not compact_content:
-            return 0.0
-        terms = cls._terms(query)
-        matched = sum(1 for term in terms if term in compact_content)
-        term_score = matched / max(1, len(terms))
-        exact_bonus = 1.0 if compact_query in compact_content else 0.0
-        return round(exact_bonus + term_score, 4)
+        return EvidenceRetriever.relevance(query, content)
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         citation_schema = {
@@ -131,7 +122,7 @@ class AgentToolbox:
                 "type": "function",
                 "function": {
                     "name": "search_timeline",
-                    "description": "按语义关键词检索 ASR/OCR 时间轴，返回最相关且可引用的片段。",
+                            "description": "按关键词和字符片段混合检索 ASR/OCR 时间轴，返回带分数明细且可引用的片段。",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -242,30 +233,7 @@ class AgentToolbox:
         top_k: int = 8,
         sources: list[str] | None = None,
     ) -> dict[str, Any]:
-        normalized_query = re.sub(r"\s+", " ", str(query)).strip()
-        if not normalized_query:
-            raise ValueError("检索词不能为空")
-        top_k = max(1, min(int(top_k), 20))
-        allowed_sources = {str(item).upper() for item in sources or []}
-        candidates = [
-            item for item in self.segments
-            if not allowed_sources or item["source"] in allowed_sources
-        ]
-        ranked = [
-            {**item, "score": self._relevance(normalized_query, item["content"])}
-            for item in candidates
-        ]
-        ranked.sort(key=lambda item: (-item["score"], item["startMs"], str(item["segmentId"])))
-        positive = [item for item in ranked if item["score"] > 0]
-        fallback = not positive
-        matches = (positive or ranked)[:top_k]
-        return {
-            "ok": True,
-            "query": normalized_query,
-            "matches": matches,
-            "matchedCount": len(positive),
-            "fallbackToTimelineStart": fallback,
-        }
+        return self.retriever.search(query, top_k=top_k, sources=sources)
 
     def _get_evidence_window(
         self,

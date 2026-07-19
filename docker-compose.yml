@@ -60,6 +60,9 @@ services:
       AI_MODEL: ${AI_MODEL:-deepseek-v4-flash}
       AI_THINKING_MODE: ${AI_THINKING_MODE:-disabled}
       AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-180}
+      AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS:-8}
+      AGENT_MEMORY_MAX_MESSAGES: ${AGENT_MEMORY_MAX_MESSAGES:-12}
+      AGENT_HISTORY_MAX_MESSAGES: ${AGENT_HISTORY_MAX_MESSAGES:-200}
     volumes:
       - seeit_uploads:/data/uploads
     depends_on:

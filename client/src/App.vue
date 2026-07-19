@@ -185,6 +185,18 @@
               </div>
             </div>
 
+            <button
+                v-if="item.hasAnalysisReport || item.agentMessageCount"
+                class="card-agent-history"
+                @click="openAgent(item)"
+            >
+              <span class="history-summary-line">
+                <strong>Agent 历史</strong>
+                <span>{{ item.agentMessageCount ? `${Math.floor(item.agentMessageCount / 2)} 轮追问` : '已有分析报告' }}</span>
+              </span>
+              <span class="history-preview">{{ agentHistoryPreview(item) }}</span>
+            </button>
+
             <div class="action-dock">
               <button class="dock-item" @click="downloadAudio(item)">
                 <span class="item-icon">
@@ -214,6 +226,7 @@
                 </span>
                 <div class="label-group">
                   <span class="item-label">Video Agent</span>
+                  <span class="item-sub">{{ item.hasAnalysisReport ? '查看历史 / 继续追问' : '开始分析' }}</span>
                 </div>
                 <div class="shimmer"></div>
               </button>
@@ -236,7 +249,7 @@
           </div>
           <button class="close-btn" @click="closeSidebar">×</button>
         </div>
-        <div class="sidebar-body">
+        <div ref="sidebarBodyRef" class="sidebar-body">
           <div v-if="sidebar.type === 'ai' && sidebar.mode === 'compose'" class="agent-composer">
             <p class="agent-caption">告诉 Agent 你希望从视频中得到什么产物</p>
             <textarea v-model="sidebar.goal" maxlength="500" placeholder="例如：梳理核心观点，给出带时间戳的证据和可执行建议"></textarea>
@@ -260,7 +273,22 @@
 
           <div v-else>
             <div v-if="sidebar.type === 'ai'">
-              <div class="markdown-content" v-html="renderedMarkdown"></div>
+              <div class="markdown-content report-content" v-html="renderedMarkdown"></div>
+              <section v-if="sidebar.followUps?.length" class="conversation-history" aria-label="历史追问">
+                <article
+                    v-for="(turn, index) in sidebar.followUps"
+                    :key="turn.id || `${index}-${turn.question}`"
+                    :ref="element => setFollowUpRef(element, index)"
+                    class="conversation-turn"
+                >
+                  <div class="conversation-question">
+                    <span>追问 {{ index + 1 }}</span>
+                    <small v-if="turn.goal && turn.goal !== sidebar.goal">{{ turn.goal }}</small>
+                    <p>{{ turn.question }}</p>
+                  </div>
+                  <div class="markdown-content conversation-answer" v-html="renderMarkdown(turn.answer)"></div>
+                </article>
+              </section>
               <div v-if="sidebar.plan?.tasks?.length || traceStages.length || traceToolCalls.length" class="agent-inspector">
                 <div v-if="sidebar.plan?.tasks?.length" class="agent-meta-block">
                   <span class="meta-label">Planner 任务</span>
@@ -269,6 +297,13 @@
                 <div v-if="traceStages.length" class="agent-meta-block">
                   <span class="meta-label">执行轨迹</span>
                   <div class="stage-list"><span v-for="stage in traceStages" :key="stage[0]">{{ stage[0] }} · {{ stage[1] }}ms</span></div>
+                </div>
+                <div v-if="sidebar.trace?.graph" class="agent-meta-block">
+                  <span class="meta-label">状态图 · {{ sidebar.trace.graph.framework }}</span>
+                  <div class="stage-list">
+                    <span>意图 {{ sidebar.trace.graph.intent }}</span>
+                    <span>执行 {{ sidebar.trace.graph.steps }}/{{ sidebar.trace.graph.maxSteps }} 步</span>
+                  </div>
                 </div>
                 <div v-if="traceToolCalls.length" class="agent-meta-block">
                   <span class="meta-label">工具调用 · {{ sidebar.trace.agentMode }} · {{ traceToolCalls.length }} 次</span>
@@ -285,6 +320,10 @@
                   <span>结构完整 {{ sidebar.evaluation.structuredValid ? '通过' : '待完善' }}</span>
                   <span>证据支持 {{ formatPercent(sidebar.evaluation.evidenceSupportRate) }}</span>
                   <span>Critic {{ sidebar.evaluation.criticPassed ? '通过' : '达到轮次上限' }}</span>
+                </div>
+                <div v-if="sidebar.memory?.sessionId" class="agent-meta-block">
+                  <span class="meta-label">短期记忆 · {{ sidebar.memory.sessionCount || 1 }} 个会话 · {{ sidebar.followUps?.length || 0 }} 轮追问</span>
+                  <div class="stage-list"><span>{{ sidebar.memory.goal }}</span></div>
                 </div>
               </div>
               <div class="follow-up-box">
@@ -342,7 +381,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { marked } from 'marked'
 import { apiRequest, clearAuthToken, hasAuthToken, setAuthToken } from './api'
 import { DEMO_EVALUATION, DEMO_ITEM, DEMO_PLAN, DEMO_RESULT, DEMO_TRACE } from './demoData'
@@ -374,13 +413,16 @@ const sidebar = ref({
   goal: DEFAULT_GOAL,
   followUp: '',
   followUpLoading: false,
+  followUps: [],
   plan: null,
   trace: null,
   evaluation: null,
+  memory: null,
   feedback: null,
   taskId: null,
   taskState: null,
-  statusMessage: ''
+  statusMessage: '',
+  historyLoaded: false
 })
 const currentUser = ref(null)
 const showAuthModal = ref(false)
@@ -390,6 +432,9 @@ const authMessage = ref('')
 const authError = ref(false)
 const authForm = ref({ username: '', password: '', nickname: '' })
 const pollingTimers = new Map()
+const agentStateCache = new Map()
+const sidebarBodyRef = ref(null)
+const followUpRefs = ref([])
 const traceStages = computed(() => Object.entries(sidebar.value.trace?.stageDurationMs || {}))
 const traceToolCalls = computed(() => sidebar.value.trace?.toolCalls || [])
 const MARKDOWN_TAGS = new Set([
@@ -410,11 +455,17 @@ const stopAllPolling = () => {
   Array.from(pollingTimers.keys()).forEach(stopPolling)
 }
 
-const renderedMarkdown = computed(() => {
-  if (!sidebar.value.content) return ''
-  let cleanText = sidebar.value.content.replace(/<think>[\s\S]*?<\/think>/gi, '')
+const normalizeModelText = (value) => String(value || '')
+  .replace(/\\r\\n/g, '\n')
+  .replace(/\\n/g, '\n')
+  .replace(/\\r/g, '\n')
+  .replace(/\r\n/g, '\n')
+
+const renderMarkdown = (value) => {
+  if (!value) return ''
+  let cleanText = normalizeModelText(value).replace(/<think>[\s\S]*?<\/think>/gi, '')
   if (cleanText.includes('</think>')) cleanText = cleanText.split('</think>').pop()
-  if (!cleanText.trim()) cleanText = sidebar.value.content
+  if (!cleanText.trim()) cleanText = normalizeModelText(value)
   const template = document.createElement('template')
   template.innerHTML = marked.parse(cleanText)
   template.content.querySelectorAll('*').forEach(node => {
@@ -437,7 +488,9 @@ const renderedMarkdown = computed(() => {
     }
   })
   return template.innerHTML
-})
+}
+
+const renderedMarkdown = computed(() => renderMarkdown(sidebar.value.content))
 
 // --- 核心业务逻辑 ---
 
@@ -749,6 +802,7 @@ const deleteItem = async (item) => {
     if (text === '删除成功') {
       showMsg('文件已销毁')
       list.value = list.value.filter(i => i.id !== item.id)
+      agentStateCache.delete(item.id)
     } else {
       showMsg('❌ ' + text, true)
     }
@@ -841,6 +895,8 @@ const aiAnalyze = async (id, goal) => {
   sidebar.value.loading = true
   sidebar.value.mode = 'result'
   sidebar.value.content = ''
+  sidebar.value.followUps = []
+  sidebar.value.memory = null
   sidebar.value.taskState = 'SUBMITTING'
   sidebar.value.statusMessage = '正在提交分析任务...'
 
@@ -889,7 +945,7 @@ const startPolling = (id, type, goal = '', taskId = null) => {
   }
 
   const finish = async (result, failed = false) => {
-    if (sidebar.value.visible && sidebar.value.type === type && sidebar.value.mediaId === id) {
+    if (sidebar.value.type === type && sidebar.value.mediaId === id) {
       sidebar.value.content = result
       sidebar.value.loading = false
       sidebar.value.taskState = failed ? 'FAILED' : 'COMPLETED'
@@ -979,6 +1035,7 @@ const startPolling = (id, type, goal = '', taskId = null) => {
 }
 
 const openSidebar = (type, title) => {
+  if (sidebar.value.type === 'ai' && type !== 'ai') cacheCurrentAgentState()
   sidebar.value.visible = true
   sidebar.value.type = type
   sidebar.value.title = title
@@ -988,10 +1045,24 @@ const openSidebar = (type, title) => {
   sidebar.value.taskState = null
   sidebar.value.statusMessage = ''
 }
-const closeSidebar = () => { sidebar.value.visible = false }
 
-const openAgent = (item) => {
-  sidebar.value = {
+const cloneAgentState = (state) => JSON.parse(JSON.stringify(state))
+
+const cacheCurrentAgentState = () => {
+  if (sidebar.value.type !== 'ai' || !sidebar.value.mediaId) return
+  agentStateCache.set(sidebar.value.mediaId, cloneAgentState({
+    ...sidebar.value,
+    visible: false,
+    followUpLoading: false
+  }))
+}
+
+const closeSidebar = () => {
+  cacheCurrentAgentState()
+  sidebar.value.visible = false
+}
+
+const createAgentState = (item) => ({
     visible: true,
     type: 'ai',
     mode: 'compose',
@@ -1002,14 +1073,113 @@ const openAgent = (item) => {
     goal: DEFAULT_GOAL,
     followUp: '',
     followUpLoading: false,
+    followUps: [],
     plan: null,
     trace: null,
     evaluation: null,
+    memory: null,
     feedback: null,
     taskId: null,
     taskState: null,
-    statusMessage: ''
+    statusMessage: '',
+    historyLoaded: false
+})
+
+const memoryToFollowUps = (memory) => {
+  if (!memory) return []
+  const sessions = Array.isArray(memory.sessions) && memory.sessions.length
+    ? [...memory.sessions].reverse()
+    : [memory]
+  const turns = []
+  sessions.forEach(session => {
+    let question = ''
+    ;(session.messages || []).forEach((message, index) => {
+      if (message.role === 'user') {
+        question = normalizeModelText(message.content).trim()
+      } else if (message.role === 'assistant') {
+        turns.push({
+          id: `${session.sessionId || 'memory'}-${index}`,
+          goal: session.goal || '',
+          question: question || '继续追问',
+          answer: normalizeModelText(message.content)
+        })
+        question = ''
+      }
+    })
+  })
+  return turns
+}
+
+const restoreAgentState = async (item) => {
+  const id = item.id
+  sidebar.value.loading = true
+  sidebar.value.statusMessage = '正在恢复历史分析与对话...'
+  try {
+    const [reportResponse, memoryResponse] = await Promise.all([
+      apiRequest(`/analysis/report?id=${encodeURIComponent(id)}`),
+      apiRequest(`/analysis/agent-memory?id=${encodeURIComponent(id)}`)
+    ])
+    if (sidebar.value.mediaId !== id) return
+
+    const memory = memoryResponse.ok ? await memoryResponse.json() : null
+    if (memory) {
+      sidebar.value.memory = memory
+      sidebar.value.followUps = memoryToFollowUps(memory)
+    }
+
+    if (reportResponse.ok) {
+      const report = await reportResponse.json()
+      sidebar.value.goal = report.goal || memory?.goal || item.analysisGoal || DEFAULT_GOAL
+      sidebar.value.taskId = report.taskId || null
+      sidebar.value.taskState = report.state
+      sidebar.value.content = normalizeModelText(report.report || '')
+      sidebar.value.evaluation = report.evaluation || null
+      sidebar.value.trace = report.trace || null
+      sidebar.value.mode = report.report ? 'result' : 'compose'
+      sidebar.value.loading = ['QUEUED', 'PROCESSING', 'RETRYING'].includes(report.state)
+      sidebar.value.statusMessage = report.message || (report.report ? '历史分析已恢复' : '')
+      if (sidebar.value.loading && report.taskId) {
+        startPolling(id, 'ai', sidebar.value.goal, report.taskId)
+      } else if (report.report) {
+        await refreshAgentMeta(id, sidebar.value.goal, true)
+      }
+    } else {
+      sidebar.value.mode = 'compose'
+      sidebar.value.loading = false
+      sidebar.value.statusMessage = ''
+    }
+    sidebar.value.historyLoaded = true
+    cacheCurrentAgentState()
+    sidebar.value.visible = true
+  } catch (error) {
+    console.warn('Agent 历史恢复失败', error)
+    if (sidebar.value.mediaId === id) {
+      sidebar.value.mode = 'compose'
+      sidebar.value.loading = false
+      sidebar.value.statusMessage = ''
+      sidebar.value.historyLoaded = true
+    }
   }
+}
+
+const openAgent = async (item) => {
+  if (sidebar.value.type === 'ai' && sidebar.value.mediaId === item.id) {
+    sidebar.value.visible = true
+    return
+  }
+  cacheCurrentAgentState()
+  const cached = agentStateCache.get(item.id)
+  followUpRefs.value = []
+  if (cached) {
+    sidebar.value = {
+      ...cloneAgentState(cached),
+      visible: true,
+      followUpLoading: false
+    }
+    return
+  }
+  sidebar.value = createAgentState(item)
+  if (!DEMO_MODE) await restoreAgentState(item)
 }
 
 const submitAgent = () => {
@@ -1033,6 +1203,7 @@ const showDemoResult = () => {
   sidebar.value.plan = DEMO_PLAN
   sidebar.value.trace = DEMO_TRACE
   sidebar.value.evaluation = DEMO_EVALUATION
+  sidebar.value.historyLoaded = true
 }
 
 const refreshAgentMeta = async (id, goal, includeEvaluation) => {
@@ -1040,17 +1211,20 @@ const refreshAgentMeta = async (id, goal, includeEvaluation) => {
   try {
     const requests = [
       apiRequest(`/analysis/agent-plan?${params}`),
-      apiRequest(`/analysis/agent-trace?id=${id}`)
+      apiRequest(`/analysis/agent-trace?id=${id}`),
+      apiRequest(`/analysis/agent-memory?id=${id}`)
     ]
     if (includeEvaluation) requests.push(apiRequest(`/analysis/agent-evaluation?${params}`))
     const responses = await Promise.all(requests)
     if (sidebar.value.mediaId !== id) return
     const planText = responses[0].ok ? await responses[0].text() : ''
     const traceText = responses[1].ok ? await responses[1].text() : ''
+    const memoryText = responses[2].ok ? await responses[2].text() : ''
     if (planText) sidebar.value.plan = JSON.parse(planText)
     if (traceText) sidebar.value.trace = JSON.parse(traceText)
-    if (includeEvaluation && responses[2]?.ok) {
-      const evaluationText = await responses[2].text()
+    if (memoryText) sidebar.value.memory = JSON.parse(memoryText)
+    if (includeEvaluation && responses[3]?.ok) {
+      const evaluationText = await responses[3].text()
       if (evaluationText) sidebar.value.evaluation = JSON.parse(evaluationText)
     }
   } catch (error) {
@@ -1062,23 +1236,64 @@ const submitFollowUp = async () => {
   const question = sidebar.value.followUp.trim()
   if (!question) return
   if (DEMO_MODE) {
-    sidebar.value.content += `\n\n## 追问\n${question}\n\n根据 08:42 的讲解，迭代写法使用显式栈保存待访问节点，时间复杂度仍为 O(n)，额外空间复杂度为 O(h)。`
+    sidebar.value.followUps.push({
+      id: `demo-${Date.now()}`,
+      goal: sidebar.value.goal,
+      question,
+      answer: '根据 08:42 的讲解，迭代写法使用显式栈保存待访问节点，时间复杂度仍为 O(n)，额外空间复杂度为 O(h)。'
+    })
     sidebar.value.followUp = ''
+    await scrollToFollowUp(sidebar.value.followUps.length - 1)
     return
   }
   sidebar.value.followUpLoading = true
   try {
     const params = new URLSearchParams({ id: String(sidebar.value.mediaId), question })
     const res = await apiRequest(`/analysis/follow-up?${params}`, { method: 'POST' })
-    const answer = await res.text()
-    if (!res.ok) throw new Error(answer || '追问失败')
-    sidebar.value.content += `\n\n## 追问\n${question}\n\n${answer}`
+    const rawAnswer = await res.text()
+    if (!res.ok) throw new Error(rawAnswer || '追问失败')
+    let answer = rawAnswer
+    try {
+      const parsed = JSON.parse(rawAnswer)
+      if (typeof parsed === 'string') answer = parsed
+    } catch (_) {}
+    sidebar.value.followUps.push({
+      id: `follow-up-${Date.now()}`,
+      goal: sidebar.value.goal,
+      question,
+      answer: normalizeModelText(answer)
+    })
     sidebar.value.followUp = ''
+    await scrollToFollowUp(sidebar.value.followUps.length - 1)
+    await refreshAgentMeta(sidebar.value.mediaId, sidebar.value.goal, true)
+    await fetchList()
+    cacheCurrentAgentState()
+    sidebar.value.visible = true
   } catch (error) {
     showMsg(`❌ ${error.message}`, true)
   } finally {
     sidebar.value.followUpLoading = false
   }
+}
+
+const setFollowUpRef = (element, index) => {
+  if (element) followUpRefs.value[index] = element
+}
+
+const scrollToFollowUp = async (index) => {
+  await nextTick()
+  const body = sidebarBodyRef.value
+  const target = followUpRefs.value[index]
+  if (!body || !target) return
+  const top = target.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 12
+  body.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+}
+
+const agentHistoryPreview = (item) => {
+  if (item.agentLastMessage) {
+    return normalizeModelText(item.agentLastMessage).replace(/\s+/g, ' ').trim()
+  }
+  return item.analysisGoal || '已有分析报告，点击查看并继续追问'
 }
 
 const sendFeedback = async (rating) => {
@@ -1164,6 +1379,7 @@ const logout = () => {
   currentUser.value = null
   localStorage.removeItem('user')
   clearAuthToken()
+  agentStateCache.clear()
   list.value = []
   biliPreview.value = null
   biliTask.value = null
@@ -1176,6 +1392,7 @@ const handleAuthExpired = () => {
   currentUser.value = null
   list.value = []
   sidebar.value.visible = false
+  agentStateCache.clear()
   localStorage.removeItem('user')
   showMsg('登录状态已失效，请重新登录', true)
   openAuthModal()
@@ -1785,6 +2002,47 @@ html, body, #app {
   background: #ffffff !important;
 }
 
+.app-stage .card-agent-history {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--border-tech);
+  padding: 12px 18px;
+  background: #fbfcfc;
+  color: var(--text-main);
+  text-align: left;
+  cursor: pointer;
+}
+
+.app-stage .card-agent-history:hover {
+  background: #f4faf7;
+}
+
+.app-stage .history-summary-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--accent-lime);
+  font-size: 0.78rem;
+}
+
+.app-stage .history-summary-line span {
+  color: var(--text-sub);
+  white-space: nowrap;
+}
+
+.app-stage .history-preview {
+  display: block;
+  overflow: hidden;
+  margin-top: 6px;
+  color: var(--text-sub);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .app-stage .meta-icon {
   width: 44px !important;
   height: 44px !important;
@@ -1851,6 +2109,14 @@ html, body, #app {
   color: #ffffff !important;
 }
 
+.app-stage .dock-item.ai-core .item-sub {
+  display: block;
+  margin-top: 3px;
+  color: rgba(255, 255, 255, 0.78) !important;
+  font-size: 0.7rem;
+  line-height: 1.3;
+}
+
 .app-stage .sidebar-backdrop,
 .app-stage .auth-backdrop {
   background: rgba(23, 33, 41, 0.42) !important;
@@ -1888,6 +2154,65 @@ html, body, #app {
 .app-stage .icon,
 .app-stage .meta-label {
   color: var(--accent-lime) !important;
+}
+
+.app-stage .conversation-history {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.app-stage .conversation-turn {
+  scroll-margin-top: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border-tech);
+  border-radius: 6px;
+  background: #fbfcfc;
+}
+
+.app-stage .conversation-question {
+  padding: 12px 14px 9px;
+  border-bottom: 1px solid var(--border-tech);
+  background: #f4f8f6;
+}
+
+.app-stage .conversation-question span {
+  color: var(--accent-lime);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.app-stage .conversation-question small {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--text-sub);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-stage .conversation-question p {
+  margin: 7px 0 0;
+  color: var(--text-main);
+  line-height: 1.6;
+}
+
+.app-stage .conversation-answer {
+  padding: 13px 14px 3px;
+}
+
+.app-stage .conversation-answer p:last-child,
+.app-stage .conversation-answer ul:last-child,
+.app-stage .conversation-answer ol:last-child {
+  margin-bottom: 0;
+}
+
+.app-stage .markdown-content pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .app-stage .agent-composer textarea,

@@ -253,6 +253,12 @@ def ask_video(media_id: int, question: str) -> dict[str, Any]:
     return {"answer": answer}
 
 
+@mcp.tool(title="读取 Agent 短期记忆")
+def get_agent_memory(media_id: int) -> dict[str, Any]:
+    """读取当前用户在指定视频上的最近追问会话和记忆摘要。"""
+    return _api_request("GET", "/analysis/agent-memory", params={"id": media_id})
+
+
 @mcp.tool(title="预览哔哩哔哩视频")
 def preview_bilibili_video(bvid: str) -> dict[str, Any]:
     """校验 BV 号并读取公开视频的标题、作者和时长。"""

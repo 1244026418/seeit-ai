@@ -22,6 +22,7 @@ def test_mcp_server_exposes_video_tools_and_resources() -> None:
         "get_analysis_status",
         "get_analysis_report",
         "ask_video",
+        "get_agent_memory",
     } <= tool_names
     assert {str(item.uriTemplate) for item in templates} == {
         "seeit://media/{media_id}/metadata",
