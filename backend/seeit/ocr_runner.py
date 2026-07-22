@@ -13,7 +13,7 @@ def env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-def paddle_ocr_content(result: Any, confidence_threshold: float, min_length: int = 2) -> str:
+def paddle_ocr_content(result: Any, confidence_threshold: float, min_length: int = 1) -> str:
     payload = result.json if hasattr(result, "json") else result
     if isinstance(payload, dict) and isinstance(payload.get("res"), dict):
         payload = payload["res"]
@@ -34,7 +34,24 @@ def paddle_ocr_content(result: Any, confidence_threshold: float, min_length: int
     return " ".join(accepted)[:2000]
 
 
-def run(input_dir: Path) -> dict[str, Any]:
+def _write_progress(progress_file: Path | None, current: int, total: int) -> None:
+    if progress_file is None:
+        return
+    temporary = progress_file.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"current": max(0, int(current)), "total": max(0, int(total))}),
+        encoding="utf-8",
+    )
+    os.replace(temporary, progress_file)
+
+
+def run(input_dir: Path, progress_file: Path | None = None) -> dict[str, Any]:
+    frames = sorted(
+        frame
+        for pattern in ("frame-*.png", "frame-*.jpg", "frame-*.jpeg")
+        for frame in input_dir.glob(pattern)
+    )
+    _write_progress(progress_file, 0, len(frames))
     model_root = Path(env("PADDLEOCR_MODEL_ROOT", "/data/models/paddlex")).resolve()
     model_root.mkdir(parents=True, exist_ok=True)
     os.environ["PADDLE_PDX_CACHE_HOME"] = str(model_root)
@@ -42,7 +59,7 @@ def run(input_dir: Path) -> dict[str, Any]:
     from paddleocr import PaddleOCR
 
     confidence = min(1.0, max(0.0, float(env("PADDLEOCR_CONFIDENCE_THRESHOLD", "0.65"))))
-    min_length = max(1, int(env("PADDLEOCR_MIN_TEXT_LENGTH", "2")))
+    min_length = max(1, int(env("PADDLEOCR_MIN_TEXT_LENGTH", "1")))
     started = time.perf_counter()
     model_started = time.perf_counter()
     model = PaddleOCR(
@@ -60,11 +77,6 @@ def run(input_dir: Path) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    frames = sorted(
-        frame
-        for pattern in ("frame-*.png", "frame-*.jpg", "frame-*.jpeg")
-        for frame in input_dir.glob(pattern)
-    )
     for index, frame in enumerate(frames):
         try:
             predictions = model.predict(
@@ -85,6 +97,8 @@ def run(input_dir: Path) -> dict[str, Any]:
             results.append({"index": index, "frame": frame.name, "content": content})
         except Exception as exc:
             errors.append({"frame": frame.name, "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            _write_progress(progress_file, index + 1, len(frames))
 
     return {
         "frameCount": len(frames),
@@ -99,10 +113,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--progress-file")
     args = parser.parse_args()
     output = Path(args.output)
     try:
-        payload = run(Path(args.input_dir))
+        payload = run(Path(args.input_dir), Path(args.progress_file) if args.progress_file else None)
         status = 0
     except Exception as exc:
         payload = {"frameCount": 0, "results": [], "errors": [], "fatalError": f"{type(exc).__name__}: {exc}"}

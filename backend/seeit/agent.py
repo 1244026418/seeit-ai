@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from seeit.retrieval import EvidenceRetriever
+from seeit.retrieval import EvidenceRetriever, SearchRetriever
 
 
 ReportNormalizer = Callable[[dict[str, Any]], dict[str, Any]]
@@ -23,7 +23,7 @@ def build_agent_plan(goal: str) -> dict[str, Any]:
             "展开关键证据窗口并生成会议复盘",
             "校验每条结论的时间戳与原始证据",
         ]
-    elif re.search(r"步骤|操作|教程|流程|怎么|如何", normalized):
+    elif re.search(r"步骤|操作|教程|流程|怎么做|怎样做|如何(?:操作|完成|实现|使用|配置|部署)", normalized):
         intent = "OPERATION_GUIDE"
         tasks = [
             "读取视频元数据并识别操作教程目标",
@@ -67,13 +67,16 @@ class AgentToolbox:
         segments: list[dict[str, Any]],
         normalize_report: ReportNormalizer,
         evaluate_report: ReportEvaluator,
+        retriever: SearchRetriever | None = None,
     ) -> None:
         self.metadata = dict(metadata)
         self.segments = [self._public_segment(item, index) for index, item in enumerate(segments)]
-        self.retriever = EvidenceRetriever(self.segments)
+        self.retriever = retriever or EvidenceRetriever(self.segments)
         self.normalize_report = normalize_report
         self.evaluate_report = evaluate_report
         self._trace: list[dict[str, Any]] = []
+        self._goal_coverage_plan: dict[str, Any] | None = None
+        self._goal_evidence_sufficiency: dict[str, Any] | None = None
 
     @staticmethod
     def _public_segment(item: dict[str, Any], index: int) -> dict[str, Any]:
@@ -122,7 +125,10 @@ class AgentToolbox:
                 "type": "function",
                 "function": {
                     "name": "search_timeline",
-                            "description": "按关键词和字符片段混合检索 ASR/OCR 时间轴，返回带分数明细且可引用的片段。",
+                    "description": (
+                        "结合词法、语义和时间锚点检索 ASR/OCR 时间轴；多问句、枚举和分别题会返回"
+                        "coveragePlan 与 evidenceSufficiency，生成答案前应检查所有证据需求是否覆盖。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -172,16 +178,28 @@ class AgentToolbox:
                 "type": "function",
                 "function": {
                     "name": "generate_report",
-                    "description": "提交最终结构化报告。工具会执行 Critic 校验；未通过时应继续检索并修订。",
+                    "description": (
+                        "提交最终结构化报告。answerable=true 时必须给出由视频证据支持的 finalAnswer 和引用；"
+                        "answerable=false 时 finalAnswer 必须明确说明视频未提供答案，不得补充外部知识。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "answerable": {"type": "boolean"},
+                            "finalAnswer": {"type": "string", "minLength": 1, "maxLength": 2000},
                             "title": {"type": "string"},
                             "conclusions": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
                             "evidence": {"type": "array", "items": citation_schema, "maxItems": 20},
                             "suggestions": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
                         },
-                        "required": ["title", "conclusions", "evidence", "suggestions"],
+                        "required": [
+                            "answerable",
+                            "finalAnswer",
+                            "title",
+                            "conclusions",
+                            "evidence",
+                            "suggestions",
+                        ],
                         "additionalProperties": False,
                     },
                 },
@@ -224,6 +242,45 @@ class AgentToolbox:
         selected = set(tool_names)
         return sum(item["durationMs"] for item in self._trace if item["tool"] in selected)
 
+    def prefetch_goal_evidence(self, goal: str, top_k: int = 8) -> dict[str, Any]:
+        result = self.execute("search_timeline", {"query": goal, "top_k": top_k})
+        self._goal_coverage_plan = dict(result.get("coveragePlan") or {}) or None
+        self._goal_evidence_sufficiency = (
+            dict(result.get("evidenceSufficiency") or {}) or None
+        )
+        return result
+
+    def goal_evidence_sufficiency(self) -> dict[str, Any] | None:
+        if self._goal_evidence_sufficiency is None:
+            return None
+        return json.loads(json.dumps(self._goal_evidence_sufficiency, ensure_ascii=False))
+
+    def _merge_goal_coverage(self, matches: list[dict[str, Any]]) -> None:
+        state = self._goal_evidence_sufficiency
+        if not state or state.get("decision") == "INSUFFICIENT_EVIDENCE":
+            return
+        contents = [str(item.get("content", "")) for item in matches]
+        requirements = [dict(item) for item in state.get("requirements", [])]
+        for requirement in requirements:
+            if requirement.get("satisfied"):
+                continue
+            markers = [str(item) for item in requirement.get("markers", [])]
+            if markers and any(
+                any(marker.replace(" ", "").lower() in content.replace(" ", "").lower()
+                    for marker in markers)
+                for content in contents
+            ):
+                requirement["satisfied"] = True
+                requirement["markerCovered"] = True
+                requirement["status"] = "SATISFIED_BY_FOLLOWUP"
+        satisfied = sum(bool(item.get("satisfied")) for item in requirements)
+        state["requirements"] = requirements
+        state["satisfiedRequirementCount"] = satisfied
+        state["fullyCovered"] = bool(requirements) and satisfied == len(requirements)
+        state["decision"] = (
+            "SUFFICIENT_CANDIDATES" if state["fullyCovered"] else "PARTIAL_EVIDENCE"
+        )
+
     def _get_video_metadata(self) -> dict[str, Any]:
         return {"ok": True, **self.metadata, "evidenceSegmentCount": len(self.segments)}
 
@@ -233,7 +290,9 @@ class AgentToolbox:
         top_k: int = 8,
         sources: list[str] | None = None,
     ) -> dict[str, Any]:
-        return self.retriever.search(query, top_k=top_k, sources=sources)
+        result = self.retriever.search(query, top_k=top_k, sources=sources)
+        self._merge_goal_coverage([dict(item) for item in result.get("matches", [])])
+        return result
 
     def _get_evidence_window(
         self,
@@ -259,6 +318,8 @@ class AgentToolbox:
 
     def _verify_citations(self, citations: list[dict[str, Any]]) -> dict[str, Any]:
         candidate = self.normalize_report({
+            "answerable": True,
+            "finalAnswer": "校验候选引用",
             "title": "引用校验",
             "conclusions": ["校验候选引用"],
             "evidence": citations,
@@ -277,15 +338,68 @@ class AgentToolbox:
         conclusions: list[str],
         evidence: list[dict[str, Any]],
         suggestions: list[str],
+        answerable: bool | None = None,
+        finalAnswer: str = "",
         **_: Any,
     ) -> dict[str, Any]:
+        coverage = self.goal_evidence_sufficiency()
+        if answerable and coverage and (
+            coverage.get("decision") == "INSUFFICIENT_EVIDENCE"
+            or not coverage.get("fullyCovered")
+        ):
+            missing_requirements = [
+                str(item.get("requirementId"))
+                for item in coverage.get("requirements", [])
+                if not item.get("satisfied")
+            ]
+            return {
+                "ok": True,
+                "report": self.normalize_report({
+                    "answerable": answerable,
+                    "finalAnswer": finalAnswer,
+                    "title": title,
+                    "conclusions": conclusions,
+                    "evidence": evidence,
+                    "suggestions": suggestions,
+                }),
+                "evaluation": {
+                    "structuredValid": True,
+                    "criticPassed": False,
+                    "coverageGatePassed": False,
+                    "evidenceSufficiency": coverage,
+                },
+                "accepted": False,
+                "message": (
+                    "证据覆盖门禁未通过；缺少关键实体或未覆盖全部证据需求："
+                    + ", ".join(missing_requirements or ["required-anchor"])
+                ),
+            }
         report = self.normalize_report({
+            "answerable": answerable,
+            "finalAnswer": finalAnswer,
             "title": title,
             "conclusions": conclusions,
             "evidence": evidence,
             "suggestions": suggestions,
         })
         evaluation = self.evaluate_report(report, self.segments)
+        if report.get("answerable") and report.get("evidence") and not evaluation["criticPassed"]:
+            supported_evidence = []
+            for citation in report["evidence"]:
+                single = self.evaluate_report({**report, "evidence": [citation]}, self.segments)
+                if single.get("supportedCitationCount") == 1:
+                    supported_evidence.append(citation)
+            if supported_evidence and len(supported_evidence) < len(report["evidence"]):
+                discarded_count = len(report["evidence"]) - len(supported_evidence)
+                repaired = {**report, "evidence": supported_evidence}
+                repaired_evaluation = self.evaluate_report(repaired, self.segments)
+                if repaired_evaluation["criticPassed"]:
+                    report = repaired
+                    evaluation = {
+                        **repaired_evaluation,
+                        "citationRepairApplied": True,
+                        "discardedCitationCount": discarded_count,
+                    }
         return {
             "ok": True,
             "report": report,

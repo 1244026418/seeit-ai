@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 import jwt
@@ -35,12 +35,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from seeit.agent import AgentToolbox, build_agent_plan
 from seeit.agent_graph import run_langgraph_agent
+from seeit.agent_structured import AgentQualityGateError, run_structured_evidence_agent
 from seeit.bilibili import (
     BilibiliImportError,
     download_bilibili_video,
     fetch_bilibili_metadata,
     normalize_bvid,
 )
+from seeit.runtime_retrieval import build_runtime_retriever, delete_runtime_media_index
 
 load_dotenv()
 
@@ -60,7 +62,7 @@ BILIBILI_MAX_FILE_BYTES = int(env("BILIBILI_MAX_FILE_BYTES", str(512 * 1024 * 10
 STALE_TASK_SECONDS = int(env("STALE_TASK_SECONDS", "1800"))
 QUEUED_TASK_FALLBACK_SECONDS = max(1, int(env("QUEUED_TASK_FALLBACK_SECONDS", "10")))
 UPLOAD_SESSION_TTL_HOURS = int(env("UPLOAD_SESSION_TTL_HOURS", "24"))
-OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "30")))
+OCR_INTERVAL_SECONDS = max(1, int(env("OCR_INTERVAL_SECONDS", "15")))
 JWT_SECRET = env("JWT_SECRET", "development-only-change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = int(env("JWT_EXPIRE_HOURS", "24"))
@@ -78,6 +80,8 @@ _local_asr_lock = threading.Lock()
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+
+ProgressCallback = Callable[[str, int, int, str], None]
 
 
 class Base(DeclarativeBase):
@@ -161,9 +165,15 @@ class AnalysisTask(Base):
     goal_hash: Mapped[str] = mapped_column(String(64))
     active_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     state: Mapped[str] = mapped_column(String(20), default="QUEUED")
+    stage: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    progress_current: Mapped[int] = mapped_column(Integer, default=0)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0)
+    progress_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=MAX_ANALYSIS_ATTEMPTS)
     result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    answerable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    final_answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     plan_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     trace_json: Mapped[Optional[str]] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), nullable=True)
@@ -224,6 +234,43 @@ class AgentMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+def emit_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    current: int = 0,
+    total: int = 0,
+    message: str = "",
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(stage, max(0, int(current)), max(0, int(total)), message[:255])
+    except Exception:
+        log.exception("analysis_progress_callback_failed stage=%s", stage)
+
+
+def persist_analysis_progress(
+    task_id: str,
+    stage: str,
+    current: int = 0,
+    total: int = 0,
+    message: str = "",
+) -> None:
+    with SessionLocal() as db:
+        db.execute(
+            update(AnalysisTask)
+            .where(AnalysisTask.id == task_id)
+            .values(
+                stage=stage[:32],
+                progress_current=max(0, int(current)),
+                progress_total=max(0, int(total)),
+                progress_message=message[:255] or None,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+
+
 class AuthRequest(BaseModel):
     username: str
     password: str
@@ -270,8 +317,93 @@ class CitationVerificationRequest(BaseModel):
     citations: list[CitationRequest] = Field(min_length=1, max_length=20)
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _usage_percentile(values: list[int], percentile: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * percentile + 0.999999)))
+    return ordered[index]
+
+
+def summarize_provider_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
+    costs = [
+        _safe_float(item.get("estimatedCostUsd"))
+        for item in events
+        if item.get("estimatedCostUsd") is not None
+    ]
+    latencies = [_safe_int(item.get("latencyMs")) for item in events]
+    by_phase: dict[str, dict[str, int]] = {}
+    for item in events:
+        phase = str(item.get("phase") or "UNSPECIFIED")
+        summary = by_phase.setdefault(phase, {
+            "requestCount": 0,
+            "successCount": 0,
+            "failureCount": 0,
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "totalTokens": 0,
+            "cacheHitTokens": 0,
+            "cacheMissTokens": 0,
+            "toolCallCount": 0,
+        })
+        summary["requestCount"] += 1
+        summary["successCount"] += int(bool(item.get("success")))
+        summary["failureCount"] += int(not bool(item.get("success")))
+        for key in (
+            "promptTokens",
+            "completionTokens",
+            "totalTokens",
+            "cacheHitTokens",
+            "cacheMissTokens",
+            "toolCallCount",
+        ):
+            summary[key] += _safe_int(item.get(key))
+    return {
+        "requestCount": len(events),
+        "successCount": sum(bool(item.get("success")) for item in events),
+        "failureCount": sum(not bool(item.get("success")) for item in events),
+        "usageReportedCount": sum(bool(item.get("usageReported")) for item in events),
+        "promptTokens": sum(_safe_int(item.get("promptTokens")) for item in events),
+        "completionTokens": sum(_safe_int(item.get("completionTokens")) for item in events),
+        "totalTokens": sum(_safe_int(item.get("totalTokens")) for item in events),
+        "cacheHitTokens": sum(_safe_int(item.get("cacheHitTokens")) for item in events),
+        "cacheMissTokens": sum(_safe_int(item.get("cacheMissTokens")) for item in events),
+        "toolCallCount": sum(_safe_int(item.get("toolCallCount")) for item in events),
+        "estimatedCostUsd": round(sum(costs), 8) if costs else None,
+        "costConfigured": bool(costs),
+        "latencyMsTotal": sum(latencies),
+        "latencyMsP50": _usage_percentile(latencies, 0.50),
+        "latencyMsP95": _usage_percentile(latencies, 0.95),
+        "byPhase": dict(sorted(by_phase.items())),
+    }
+
+
 class Provider:
     agent_mode = "DETERMINISTIC_TOOL_PIPELINE"
+
+    def _record_provider_usage(self, event: dict[str, Any]) -> None:
+        events = self.__dict__.setdefault("_provider_usage_events", [])
+        events.append({"requestIndex": len(events) + 1, **event})
+
+    def provider_usage_events(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.__dict__.get("_provider_usage_events", [])]
+
+    def provider_usage_summary(self) -> dict[str, Any]:
+        return summarize_provider_usage(self.provider_usage_events())
 
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         raise NotImplementedError
@@ -391,6 +523,12 @@ class MockProvider(Provider):
         if len(conclusions) == 1:
             conclusions.extend(item["content"][:320] for item in evidence[:4])
         return {
+            "answerable": bool(evidence),
+            "finalAnswer": (
+                conclusions[0]
+                if evidence
+                else "视频未明确说明该问题，无法从视频确定答案。"
+            ),
             "title": "视频内容分析报告",
             "conclusions": conclusions,
             "evidence": evidence,
@@ -417,11 +555,62 @@ class OpenAICompatibleProvider(Provider):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
         self.model = model
+        self._agent_phase = "UNSPECIFIED"
+
+    @staticmethod
+    def _usage_tokens(usage: dict[str, Any]) -> dict[str, Any]:
+        prompt_tokens = _safe_int(usage.get("prompt_tokens"))
+        completion_tokens = _safe_int(usage.get("completion_tokens"))
+        total_tokens = _safe_int(usage.get("total_tokens"))
+        prompt_details = usage.get("prompt_tokens_details")
+        prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+        cache_hit_raw = usage.get("prompt_cache_hit_tokens")
+        if cache_hit_raw is None:
+            cache_hit_raw = prompt_details.get("cached_tokens")
+        cache_hit_tokens = _safe_int(cache_hit_raw)
+        cache_miss_raw = usage.get("prompt_cache_miss_tokens")
+        cache_miss_tokens = (
+            _safe_int(cache_miss_raw)
+            if cache_miss_raw is not None
+            else max(0, prompt_tokens - cache_hit_tokens)
+        )
+        usage_reported = any(
+            key in usage and usage.get(key) is not None
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+        return {
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
+            "cacheHitTokens": cache_hit_tokens,
+            "cacheMissTokens": cache_miss_tokens,
+            "usageReported": usage_reported,
+        }
+
+    @staticmethod
+    def _token_cost(tokens: dict[str, Any]) -> float | None:
+        input_rate = max(0.0, _safe_float(env("AI_INPUT_COST_PER_MILLION_TOKENS", "0")))
+        output_rate = max(0.0, _safe_float(env("AI_OUTPUT_COST_PER_MILLION_TOKENS", "0")))
+        cache_hit_rate = max(0.0, _safe_float(env("AI_CACHE_HIT_INPUT_COST_PER_MILLION_TOKENS", "0")))
+        if input_rate <= 0 or output_rate <= 0 or not tokens.get("usageReported"):
+            return None
+        prompt_tokens = _safe_int(tokens.get("promptTokens"))
+        completion_tokens = _safe_int(tokens.get("completionTokens"))
+        cache_hit_tokens = _safe_int(tokens.get("cacheHitTokens"))
+        uncached_tokens = max(0, prompt_tokens - cache_hit_tokens)
+        effective_cache_rate = cache_hit_rate if cache_hit_rate > 0 else input_rate
+        cost = (
+            uncached_tokens * input_rate
+            + cache_hit_tokens * effective_cache_rate
+            + completion_tokens * output_rate
+        ) / 1_000_000
+        return round(cost, 8)
 
     def _completion(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Any = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -433,15 +622,56 @@ class OpenAICompatibleProvider(Provider):
             payload["thinking"] = {"type": thinking_mode}
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        response = httpx.post(
-            self.url,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload,
-            timeout=max(30, int(env("AI_REQUEST_TIMEOUT_SECONDS", "180"))),
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]
+            payload["tool_choice"] = tool_choice or "auto"
+        started = time.perf_counter()
+        response: Any = None
+        try:
+            response = httpx.post(
+                self.url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload,
+                timeout=max(30, int(env("AI_REQUEST_TIMEOUT_SECONDS", "180"))),
+            )
+            response.raise_for_status()
+            body = response.json()
+            message = body["choices"][0]["message"]
+            usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+            tokens = self._usage_tokens(usage)
+            headers = getattr(response, "headers", {}) or {}
+            self._record_provider_usage({
+                "provider": self.__class__.__name__,
+                "model": self.model,
+                "phase": self._agent_phase,
+                "success": True,
+                "statusCode": int(getattr(response, "status_code", 200)),
+                "latencyMs": max(0, int((time.perf_counter() - started) * 1000)),
+                **tokens,
+                "estimatedCostUsd": self._token_cost(tokens),
+                "toolCallCount": len(message.get("tool_calls") or []),
+                "requestId": str(headers.get("x-request-id") or headers.get("x-requestid") or "")[:200] or None,
+                "errorType": None,
+            })
+            return message
+        except Exception as exc:
+            self._record_provider_usage({
+                "provider": self.__class__.__name__,
+                "model": self.model,
+                "phase": self._agent_phase,
+                "success": False,
+                "statusCode": int(getattr(response, "status_code", 0) or 0),
+                "latencyMs": max(0, int((time.perf_counter() - started) * 1000)),
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "totalTokens": 0,
+                "cacheHitTokens": 0,
+                "cacheMissTokens": 0,
+                "usageReported": False,
+                "estimatedCostUsd": None,
+                "toolCallCount": 0,
+                "requestId": None,
+                "errorType": type(exc).__name__,
+            })
+            raise
 
     def _chat(self, prompt: str) -> str:
         message = self._completion([{"role": "user", "content": prompt}])
@@ -449,7 +679,8 @@ class OpenAICompatibleProvider(Provider):
 
     def analyze(self, transcript: str, goal: str) -> dict[str, Any]:
         prompt = (
-            "只返回 JSON，字段为 title、conclusions、evidence、suggestions。"
+            "只返回 JSON，字段为 answerable、finalAnswer、title、conclusions、evidence、suggestions。"
+            "如果视频证据无法回答，answerable=false，finalAnswer 明确拒答，evidence 为空，且不得补充外部知识。"
             "evidence 必须包含 timestampMs、source、content。"
             "只能引用证据时间轴中存在的内容和时间戳，不得编造。"
             f"\n目标：{goal}\n证据时间轴：\n{transcript[:16000]}"
@@ -487,6 +718,9 @@ class OpenAICompatibleProvider(Provider):
         return str(message.get("content") or "").strip()
 
     def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
+        pipeline = env("AGENT_PIPELINE_VERSION", "structured-v5").strip().lower()
+        if pipeline in {"structured-v5", "v5", "structured"}:
+            return run_structured_evidence_agent(self, toolbox, goal)
         max_steps = max(3, min(int(env("AGENT_MAX_TOOL_STEPS", "8")), 12))
         return run_langgraph_agent(self, toolbox, goal, max_steps=max_steps)
 
@@ -582,7 +816,11 @@ def md5_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_video_file(path: Path) -> dict[str, Any]:
+def validate_video_file(
+    path: Path,
+    *,
+    max_duration_seconds: int | None = None,
+) -> dict[str, Any]:
     completed = subprocess.run(
         [
             "ffprobe",
@@ -608,7 +846,14 @@ def validate_video_file(path: Path) -> dict[str, Any]:
     if not streams:
         raise ValueError("文件中未检测到视频轨道")
     duration = float((payload.get("format") or {}).get("duration") or 0)
-    max_duration = int(env("MAX_VIDEO_DURATION_SECONDS", "600"))
+    max_duration = max(
+        1,
+        int(
+            max_duration_seconds
+            if max_duration_seconds is not None
+            else env("MAX_VIDEO_DURATION_SECONDS", "900")
+        ),
+    )
     if duration <= 0:
         raise ValueError("无法读取视频时长")
     if duration > max_duration:
@@ -753,7 +998,10 @@ def release_local_asr_model() -> None:
     log.info("local_asr_model_released")
 
 
-def request_local_asr(media_path: Path) -> list[dict[str, Any]]:
+def request_local_asr(
+    media_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     model = local_asr_model()
     started = time.perf_counter()
     language = env("LOCAL_ASR_LANGUAGE", "zh").strip() or None
@@ -766,16 +1014,34 @@ def request_local_asr(media_path: Path) -> list[dict[str, Any]]:
         initial_prompt=env("LOCAL_ASR_INITIAL_PROMPT") or None,
         hotwords=env("LOCAL_ASR_HOTWORDS") or None,
     )
-    segments = [
-        {
+    duration_seconds = max(1, int(float(getattr(info, "duration", 0) or 0) + 0.999))
+    segments: list[dict[str, Any]] = []
+    last_reported = -5
+    for item in segments_iter:
+        if item.text.strip():
+            segments.append({
             "source": "ASR",
             "startMs": max(0, int(item.start * 1000)),
             "endMs": max(0, int(item.end * 1000)),
             "content": item.text.strip(),
-        }
-        for item in segments_iter
-        if item.text.strip()
-    ]
+            })
+        current_seconds = min(duration_seconds, max(0, int(float(item.end) + 0.999)))
+        if current_seconds >= duration_seconds or current_seconds - last_reported >= 5:
+            emit_progress(
+                progress_callback,
+                "ASR",
+                current_seconds,
+                duration_seconds,
+                f"ASR 处理中（{current_seconds}/{duration_seconds} 秒）",
+            )
+            last_reported = current_seconds
+    emit_progress(
+        progress_callback,
+        "ASR",
+        duration_seconds,
+        duration_seconds,
+        "ASR 处理完成",
+    )
     log.info(
         "local_asr_completed path=%s language=%s duration_seconds=%.3f segments=%s elapsed_ms=%s",
         media_path.name,
@@ -787,10 +1053,13 @@ def request_local_asr(media_path: Path) -> list[dict[str, Any]]:
     return segments
 
 
-def run_paddle_ocr_frames(directory: Path) -> dict[str, Any]:
+def run_paddle_ocr_frames(
+    directory: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
     output_path = directory / "paddle-results.json"
-    completed = subprocess.run(
-        [
+    progress_path = directory / "paddle-progress.json"
+    command = [
             sys.executable,
             "-m",
             "seeit.ocr_runner",
@@ -798,14 +1067,58 @@ def run_paddle_ocr_frames(directory: Path) -> dict[str, Any]:
             str(directory),
             "--output",
             str(output_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=max(60, int(env("PADDLEOCR_PROCESS_TIMEOUT_SECONDS", "600"))),
-    )
+            "--progress-file",
+            str(progress_path),
+        ]
+    stop_polling = threading.Event()
+
+    def forward_progress() -> None:
+        last_progress: tuple[int, int] | None = None
+        while not stop_polling.wait(0.25):
+            if not progress_path.exists():
+                continue
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                current = max(0, int(progress.get("current", 0)))
+                total = max(0, int(progress.get("total", 0)))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if (current, total) == last_progress:
+                continue
+            emit_progress(
+                progress_callback,
+                "OCR",
+                current,
+                total,
+                f"OCR 处理中（{current}/{total} 帧）" if total else "OCR 处理中",
+            )
+            last_progress = (current, total)
+
+    progress_thread = threading.Thread(target=forward_progress, name="ocr-progress", daemon=True)
+    if progress_callback is not None:
+        progress_thread.start()
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(60, int(env("PADDLEOCR_PROCESS_TIMEOUT_SECONDS", "600"))),
+        )
+    finally:
+        stop_polling.set()
+        if progress_thread.is_alive():
+            progress_thread.join(timeout=1)
+    if progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            current = max(0, int(progress.get("current", 0)))
+            total = max(0, int(progress.get("total", 0)))
+            emit_progress(progress_callback, "OCR", current, total, f"OCR 处理中（{current}/{total} 帧）")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
     if not output_path.exists():
         log.error(
             "paddle_ocr_process_failed returncode=%s stderr=%s",
@@ -824,11 +1137,14 @@ def run_paddle_ocr_frames(directory: Path) -> dict[str, Any]:
     return payload
 
 
-def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
+def extract_ocr_evidence(
+    path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     if env("OCR_ENABLED", "false").lower() not in {"1", "true", "yes"}:
         return []
-    interval_seconds = max(1, int(env("OCR_INTERVAL_SECONDS", "30")))
-    max_frames = max(1, int(env("PADDLEOCR_MAX_FRAMES", "20")))
+    interval_seconds = max(1, int(env("OCR_INTERVAL_SECONDS", "15")))
+    max_frames = max(1, int(env("PADDLEOCR_MAX_FRAMES", "40")))
     max_width = max(320, int(env("PADDLEOCR_FRAME_MAX_WIDTH", "960")))
     dedup_threshold = min(1.0, max(0.0, float(env("PADDLEOCR_DEDUP_THRESHOLD", "0.88"))))
     started = time.perf_counter()
@@ -859,9 +1175,21 @@ def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
             stderr=subprocess.DEVNULL,
             timeout=900,
         )
+        frame_count = len(list(Path(directory).glob("frame-*.png")))
+        emit_progress(
+            progress_callback,
+            "OCR",
+            0,
+            frame_count,
+            f"OCR 处理中（0/{frame_count} 帧）" if frame_count else "OCR 未抽取到可处理画面",
+        )
         if env("LOCAL_ASR_RELEASE_BEFORE_OCR", "true").lower() in {"1", "true", "yes"}:
             release_local_asr_model()
-        payload = run_paddle_ocr_frames(Path(directory))
+        payload = (
+            run_paddle_ocr_frames(Path(directory), progress_callback)
+            if progress_callback is not None
+            else run_paddle_ocr_frames(Path(directory))
+        )
         for error in payload.get("errors", []):
             log.warning("paddle_ocr_frame_failed frame=%s error=%s", error.get("frame"), error.get("error"))
 
@@ -890,18 +1218,30 @@ def extract_ocr_evidence(path: Path) -> list[dict[str, Any]]:
             int(payload.get("elapsedMs", 0)),
             int((time.perf_counter() - started) * 1000),
         )
+        emit_progress(
+            progress_callback,
+            "OCR",
+            int(payload.get("frameCount", 0)),
+            int(payload.get("frameCount", 0)),
+            "OCR 处理完成",
+        )
         return segments
 
 
-def collect_evidence(path: Path) -> list[dict[str, Any]]:
+def collect_evidence(
+    path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     segments = read_sidecar_evidence(path)
     if not segments and env("ASR_BASE_URL"):
+        emit_progress(progress_callback, "ASR", 0, 1, "ASR 处理中")
         temp_dir = UPLOAD_ROOT / "tmp"
         audio_path = temp_dir / f"{uuid.uuid4()}.mp3"
         try:
             extract_audio_file(path, audio_path)
             try:
                 segments = request_asr(audio_path)
+                emit_progress(progress_callback, "ASR", 1, 1, "ASR 处理完成")
             except Exception:
                 if not local_asr_enabled():
                     raise
@@ -909,8 +1249,17 @@ def collect_evidence(path: Path) -> list[dict[str, Any]]:
         finally:
             audio_path.unlink(missing_ok=True)
     if not segments and local_asr_enabled():
-        segments = request_local_asr(path)
-    segments.extend(extract_ocr_evidence(path))
+        emit_progress(progress_callback, "ASR", 0, 0, "ASR 处理中")
+        segments = (
+            request_local_asr(path, progress_callback)
+            if progress_callback is not None
+            else request_local_asr(path)
+        )
+    segments.extend(
+        extract_ocr_evidence(path, progress_callback)
+        if progress_callback is not None
+        else extract_ocr_evidence(path)
+    )
     if not segments:
         segments.append({
             "source": "SYSTEM",
@@ -959,13 +1308,17 @@ def stored_evidence(db: Session, media_id: int) -> list[dict[str, Any]]:
     ]
 
 
-def ensure_media_evidence(db: Session, media: Media) -> list[dict[str, Any]]:
+def ensure_media_evidence(
+    db: Session,
+    media: Media,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     segments = stored_evidence(db, media.id)
     asr_available = bool(env("ASR_BASE_URL")) or local_asr_enabled()
     has_asr = any(item["source"] == "ASR" for item in segments)
     if segments and (not asr_available or has_asr):
         return segments
-    collected = collect_evidence(Path(media.file_path))
+    collected = collect_evidence(Path(media.file_path), progress_callback)
     replace_evidence(db, media.id, collected)
     db.flush()
     segments = stored_evidence(db, media.id)
@@ -974,21 +1327,33 @@ def ensure_media_evidence(db: Session, media: Media) -> list[dict[str, Any]]:
     return segments
 
 
-def agent_toolbox(db: Session, media: Media, *, ensure_evidence: bool = True) -> AgentToolbox:
-    segments = ensure_media_evidence(db, media) if ensure_evidence else stored_evidence(db, media.id)
+def agent_toolbox(
+    db: Session,
+    media: Media,
+    *,
+    ensure_evidence: bool = True,
+    progress_callback: ProgressCallback | None = None,
+) -> AgentToolbox:
+    segments = (
+        ensure_media_evidence(db, media, progress_callback)
+        if ensure_evidence
+        else stored_evidence(db, media.id)
+    )
+    metadata = {
+        "mediaId": media.id,
+        "filename": media.filename,
+        "sourceType": media.source_type,
+        "sourceRef": media.source_ref,
+        "status": media.status,
+        "uploadedAt": media.upload_time.isoformat() if media.upload_time else None,
+        "hasAnalysisReport": bool(media.ai_summary),
+    }
     return AgentToolbox(
-        metadata={
-            "mediaId": media.id,
-            "filename": media.filename,
-            "sourceType": media.source_type,
-            "sourceRef": media.source_ref,
-            "status": media.status,
-            "uploadedAt": media.upload_time.isoformat() if media.upload_time else None,
-            "hasAnalysisReport": bool(media.ai_summary),
-        },
+        metadata=metadata,
         segments=segments,
         normalize_report=normalize_analysis_result,
         evaluate_report=evaluate_result,
+        retriever=build_runtime_retriever(metadata, segments),
     )
 
 
@@ -1027,12 +1392,32 @@ def normalize_analysis_result(result: dict[str, Any]) -> dict[str, Any]:
             continue
         normalized = normalize_segment(item)
         if normalized:
-            evidence.append({
+            citation = {
                 "timestampMs": normalized["startMs"],
                 "source": normalized["source"],
                 "content": normalized["content"],
-            })
+            }
+            evidence_id = str(item.get("evidenceId") or "").strip()[:64]
+            if evidence_id:
+                citation["evidenceId"] = evidence_id
+            evidence.append(citation)
+    raw_answerable = result.get("answerable")
+    if isinstance(raw_answerable, bool):
+        answerable = raw_answerable
+    elif isinstance(raw_answerable, str):
+        answerable = raw_answerable.strip().lower() not in {"false", "0", "no", "否"}
+    else:
+        answerable = bool(evidence)
+    final_answer = re.sub(r"\s+", " ", str(result.get("finalAnswer") or "")).strip()[:2000]
+    if not final_answer and conclusions:
+        final_answer = conclusions[0]
+    if not final_answer and not answerable:
+        final_answer = "视频未明确说明该问题，无法从视频确定答案。"
+    if not conclusions and final_answer:
+        conclusions = [final_answer]
     return {
+        "answerable": answerable,
+        "finalAnswer": final_answer,
         "title": str(result.get("title") or "视频分析报告").strip()[:120],
         "conclusions": conclusions,
         "evidence": evidence,
@@ -1062,12 +1447,33 @@ def evaluate_result(result: dict[str, Any], segments: list[dict[str, Any]]) -> d
             if timestamp_matches and source_matches and _content_similarity(str(citation.get("content", "")), segment["content"]) >= 0.2:
                 supported += 1
                 break
-    support_rate = supported / len(evidence) if evidence else 0.0
-    structured_valid = bool(result.get("title") and result.get("conclusions") and evidence)
+    answerable = bool(result.get("answerable", True))
+    final_answer = str(result.get("finalAnswer") or "").strip()
+    refusal_markers = (
+        "视频未", "视频中未", "视频没有", "视频中没有", "视频并未",
+        "无法从视频", "无法从当前视频", "无法根据视频", "现有视频证据不足",
+        "当前视频证据不足", "未找到足够的视频证据",
+    )
+    external_fact_markers = ("但是", "但", "不过", "然而", "通常", "一般来说", "实际上", "是指", "定义为")
+    explicit_refusal = any(marker in final_answer for marker in refusal_markers)
+    refusal_only = (
+        explicit_refusal
+        and len(final_answer) <= 200
+        and not any(marker in final_answer for marker in external_fact_markers)
+    )
+    support_rate = supported / len(evidence) if evidence else (1.0 if not answerable else 0.0)
+    if answerable:
+        structured_valid = bool(result.get("title") and final_answer and result.get("conclusions") and evidence)
+        critic_passed = structured_valid and support_rate >= 0.8
+    else:
+        structured_valid = bool(result.get("title") and final_answer and result.get("conclusions") and refusal_only)
+        critic_passed = structured_valid and not evidence
     return {
+        "answerable": answerable,
+        "explicitRefusal": explicit_refusal,
         "structuredValid": structured_valid,
         "evidenceSupportRate": round(support_rate, 4),
-        "criticPassed": structured_valid and support_rate >= 0.8,
+        "criticPassed": critic_passed,
         "citationCount": len(evidence),
         "supportedCitationCount": supported,
     }
@@ -1083,12 +1489,22 @@ def format_timestamp(milliseconds: int) -> str:
 
 
 def format_report(result: dict[str, Any]) -> str:
-    lines = [f"## {result.get('title', '视频分析报告')}", "", "### 核心结论"]
+    lines = [
+        f"## {result.get('title', '视频分析报告')}",
+        "",
+        "### 最终回答",
+        str(result.get("finalAnswer") or "未生成最终回答"),
+        "",
+        "### 核心结论",
+    ]
     lines.extend(f"- {item}" for item in result.get("conclusions", []))
     lines.extend(["", "### 视频证据"])
-    for item in result.get("evidence", []):
+    evidence = result.get("evidence", [])
+    for item in evidence:
         timestamp = format_timestamp(int(item.get("timestampMs", 0)))
         lines.append(f"- [{timestamp}] {item.get('source', 'ASR')}：{item.get('content', '')}")
+    if not evidence:
+        lines.append("- 未发现可支持该问题答案的视频证据。")
     lines.extend(["", "### 行动建议"])
     lines.extend(f"- {item}" for item in result.get("suggestions", []))
     return "\n".join(lines)
@@ -1216,6 +1632,10 @@ def process_analysis(task_id: str) -> str:
             .where(AnalysisTask.id == task_id, AnalysisTask.state.in_(["QUEUED", "RETRYING"]))
             .values(
                 state="PROCESSING",
+                stage="ASR",
+                progress_current=0,
+                progress_total=0,
+                progress_message="正在准备视频证据",
                 attempt_count=AnalysisTask.attempt_count + 1,
                 started_at=now,
                 updated_at=now,
@@ -1227,7 +1647,23 @@ def process_analysis(task_id: str) -> str:
         task = db.get(AnalysisTask, task_id)
         if not task:
             return "SKIPPED"
+        previous_trace: dict[str, Any] = {}
+        if task.trace_json:
+            try:
+                parsed_trace = json.loads(task.trace_json)
+                previous_trace = parsed_trace if isinstance(parsed_trace, dict) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                previous_trace = {}
+        previous_provider_requests = list(previous_trace.get("providerRequests") or [])
+        analysis_provider: Provider | None = None
+        toolbox: AgentToolbox | None = None
         try:
+            def report_progress(stage: str, current: int, total: int, message: str) -> None:
+                try:
+                    persist_analysis_progress(task_id, stage, current, total, message)
+                except Exception:
+                    log.exception("analysis_progress_persist_failed task_id=%s stage=%s", task_id, stage)
+
             media = db.get(Media, task.media_id)
             if not media:
                 raise RuntimeError("媒体不存在")
@@ -1236,12 +1672,28 @@ def process_analysis(task_id: str) -> str:
             plan = build_plan(task.goal)
             task.plan_json = json.dumps(plan, ensure_ascii=False)
             planner_duration = int((time.perf_counter() - planner_started) * 1000)
+            task.stage = "ASR"
+            task.progress_current = 0
+            task.progress_total = 0
+            task.progress_message = "正在准备视频证据"
+            task.updated_at = datetime.now(timezone.utc)
+            db.commit()
 
             evidence_started = time.perf_counter()
-            toolbox = agent_toolbox(db, media)
+            existing_segments = stored_evidence(db, media.id)
+            asr_available = bool(env("ASR_BASE_URL")) or local_asr_enabled()
+            evidence_reused = bool(existing_segments) and (not asr_available or any(
+                item["source"] == "ASR" for item in existing_segments
+            ))
+            if evidence_reused:
+                db.commit()
+                report_progress("AGENT", 0, 0, "证据已就绪，Agent 生成中")
+            toolbox = agent_toolbox(db, media, progress_callback=None if evidence_reused else report_progress)
             evidence_duration = int((time.perf_counter() - evidence_started) * 1000)
+            db.commit()
 
             analysis_provider = provider()
+            report_progress("AGENT", 0, 1, "Agent 生成中")
             analysis_started = time.perf_counter()
             generated = analysis_provider.run_agent(toolbox, task.goal)
             analysis_duration = int((time.perf_counter() - analysis_started) * 1000)
@@ -1250,6 +1702,11 @@ def process_analysis(task_id: str) -> str:
             result = generated["report"]
             evaluation = generated["evaluation"]
             evaluation_duration = toolbox.duration_for("verify_citations", "generate_report")
+            current_provider_requests = [
+                {**item, "attempt": task.attempt_count}
+                for item in analysis_provider.provider_usage_events()
+            ]
+            provider_requests = [*previous_provider_requests, *current_provider_requests]
             trace = {
                 "stageDurationMs": {
                     "VIDEO_CONTEXT": evidence_duration,
@@ -1264,10 +1721,18 @@ def process_analysis(task_id: str) -> str:
                 "toolCallCount": len(toolbox.trace()),
                 "toolCalls": toolbox.trace(),
                 "graph": generated.get("agentGraph"),
+                "providerUsage": summarize_provider_usage(provider_requests),
+                "providerRequests": provider_requests,
             }
 
             task.result = format_report(result)
+            task.answerable = bool(result.get("answerable", True))
+            task.final_answer = str(result.get("finalAnswer") or "").strip() or None
             task.state = "COMPLETED"
+            task.stage = "COMPLETED"
+            task.progress_current = 1
+            task.progress_total = 1
+            task.progress_message = "分析完成"
             task.error = None
             task.active_key = None
             task.trace_json = json.dumps(trace, ensure_ascii=False)
@@ -1284,10 +1749,35 @@ def process_analysis(task_id: str) -> str:
             task = db.get(AnalysisTask, task_id)
             if not task:
                 return "FAILED"
-            should_retry = task.attempt_count < task.max_attempts
+            should_retry = (
+                task.attempt_count < task.max_attempts
+                and not isinstance(exc, AgentQualityGateError)
+            )
             task.state = "RETRYING" if should_retry else "FAILED"
+            task.stage = "RETRYING" if should_retry else "FAILED"
+            task.progress_message = (
+                f"本次执行失败，准备第 {task.attempt_count + 1} 次重试"
+                if should_retry
+                else "分析失败"
+            )
             task.error = f"{exc.__class__.__name__}: {exc}"[:2000]
             task.updated_at = datetime.now(timezone.utc)
+            current_provider_requests = [
+                {**item, "attempt": task.attempt_count}
+                for item in analysis_provider.provider_usage_events()
+            ] if analysis_provider else []
+            provider_requests = [*previous_provider_requests, *current_provider_requests]
+            failure_trace = {
+                "provider": analysis_provider.__class__.__name__ if analysis_provider else None,
+                "agentMode": analysis_provider.agent_mode if analysis_provider else None,
+                "attempt": task.attempt_count,
+                "toolCallCount": len(toolbox.trace()) if toolbox else 0,
+                "toolCalls": toolbox.trace() if toolbox else [],
+                "providerUsage": summarize_provider_usage(provider_requests),
+                "providerRequests": provider_requests,
+                "lastErrorType": type(exc).__name__,
+            }
+            task.trace_json = json.dumps(failure_trace, ensure_ascii=False)
             if not should_retry:
                 task.active_key = None
                 task.finished_at = task.updated_at
@@ -1346,7 +1836,10 @@ def process_bilibili_import(task_id: str) -> str:
             raise BilibiliImportError(f"视频时长不能超过 {BILIBILI_MAX_DURATION_SECONDS // 60} 分钟")
         if downloaded.path.stat().st_size > BILIBILI_MAX_FILE_BYTES:
             raise BilibiliImportError(f"视频文件不能超过 {BILIBILI_MAX_FILE_BYTES // (1024 * 1024)} MB")
-        probe = validate_video_file(downloaded.path)
+        probe = validate_video_file(
+            downloaded.path,
+            max_duration_seconds=BILIBILI_MAX_DURATION_SECONDS,
+        )
         content_hash = md5_file(downloaded.path)
         metadata = {
             "bvid": downloaded.bvid,
@@ -1915,6 +2408,7 @@ def delete_media(id: int, user: User = Depends(current_user)) -> str:
         (UPLOAD_ROOT / "audio" / f"{media.id}.mp3").unlink(missing_ok=True)
         db.delete(media)
         db.commit()
+    delete_runtime_media_index(id)
     return "删除成功"
 
 
@@ -1951,6 +2445,10 @@ def start_analysis(id: int, goal: str = Query(default="理解视频核心内容�
             goal_hash=goal_hash,
             active_key=f"{id}:{goal_hash}",
             max_attempts=MAX_ANALYSIS_ATTEMPTS,
+            stage="QUEUED",
+            progress_current=0,
+            progress_total=0,
+            progress_message="任务已排队，等待 Worker 接收",
             plan_json=json.dumps(build_plan(normalized_goal), ensure_ascii=False),
         )
         db.add(task)
@@ -1984,12 +2482,25 @@ def analysis_status(id: int, goal: str, user: User = Depends(current_user)) -> d
             "COMPLETED": "分析完成",
             "FAILED": task.error or "分析失败",
         }
+        progress_total = max(0, int(task.progress_total or 0))
+        progress_current = max(0, int(task.progress_current or 0))
+        progress_percent = (
+            min(100, round(progress_current * 100 / progress_total))
+            if progress_total else 0
+        )
         return {
             "taskId": task.id,
             "state": task.state,
             "attemptCount": task.attempt_count,
+            "error": task.error,
             "result": task.result,
-            "message": messages.get(task.state, task.error or task.state),
+            "answerable": task.answerable,
+            "finalAnswer": task.final_answer,
+            "stage": task.stage,
+            "progressCurrent": progress_current,
+            "progressTotal": progress_total,
+            "progressPercent": progress_percent,
+            "message": task.progress_message or messages.get(task.state, task.error or task.state),
         }
 
 
@@ -2227,16 +2738,29 @@ def analysis_task_payload(task: AnalysisTask) -> dict[str, Any]:
         "COMPLETED": "分析完成",
         "FAILED": task.error or "分析失败",
     }
+    progress_total = max(0, int(task.progress_total or 0))
+    progress_current = max(0, int(task.progress_current or 0))
+    progress_percent = (
+        min(100, round(progress_current * 100 / progress_total))
+        if progress_total else 0
+    )
     return {
         "taskId": task.id,
         "mediaId": task.media_id,
         "goal": task.goal,
         "state": task.state,
         "attemptCount": task.attempt_count,
+        "error": task.error,
+        "stage": task.stage,
+        "progressCurrent": progress_current,
+        "progressTotal": progress_total,
+        "progressPercent": progress_percent,
         "report": task.result,
+        "answerable": task.answerable,
+        "finalAnswer": task.final_answer,
         "evaluation": json.loads(task.evaluation_json) if task.evaluation_json else None,
         "trace": json.loads(task.trace_json) if task.trace_json else None,
-        "message": messages.get(task.state, task.error or task.state),
+        "message": task.progress_message or messages.get(task.state, task.error or task.state),
     }
 
 
@@ -2268,6 +2792,8 @@ def analysis_report(
                 "state": "COMPLETED",
                 "attemptCount": 0,
                 "report": media.ai_summary,
+                "answerable": None,
+                "finalAnswer": None,
                 "evaluation": None,
                 "trace": None,
                 "message": "分析完成",

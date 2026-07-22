@@ -261,6 +261,13 @@
 
           <div v-else-if="sidebar.loading" class="agent-running">
             <div class="loading-state"><div class="quantum-loader small"></div><p>{{ sidebar.statusMessage || 'Agent 正在分析视频证据...' }}</p></div>
+            <div v-if="sidebar.progressTotal > 0" class="progress-status" aria-live="polite">
+              <div class="progress-label">
+                <span>{{ sidebar.stage === 'OCR' ? 'OCR 处理中' : sidebar.stage === 'ASR' ? 'ASR 处理中' : 'Agent 生成中' }}</span>
+                <span>{{ sidebar.progressCurrent }}/{{ sidebar.progressTotal }}</span>
+              </div>
+              <div class="progress-track"><div class="progress-fill" :style="{ width: `${sidebar.progressPercent}%` }"></div></div>
+            </div>
             <div v-if="sidebar.plan?.tasks?.length" class="agent-meta-block">
               <span class="meta-label">任务计划</span>
               <ol><li v-for="task in sidebar.plan.tasks" :key="task">{{ task }}</li></ol>
@@ -421,6 +428,10 @@ const sidebar = ref({
   feedback: null,
   taskId: null,
   taskState: null,
+  stage: null,
+  progressCurrent: 0,
+  progressTotal: 0,
+  progressPercent: 0,
   statusMessage: '',
   historyLoaded: false
 })
@@ -898,6 +909,10 @@ const aiAnalyze = async (id, goal) => {
   sidebar.value.followUps = []
   sidebar.value.memory = null
   sidebar.value.taskState = 'SUBMITTING'
+  sidebar.value.stage = 'ASR'
+  sidebar.value.progressCurrent = 0
+  sidebar.value.progressTotal = 0
+  sidebar.value.progressPercent = 0
   sidebar.value.statusMessage = '正在提交分析任务...'
 
   try {
@@ -919,6 +934,10 @@ const aiAnalyze = async (id, goal) => {
     if (!payload.taskId) throw new Error('服务端未返回分析任务 ID')
     sidebar.value.taskId = payload.taskId
     sidebar.value.taskState = 'QUEUED'
+    sidebar.value.stage = payload.stage || 'QUEUED'
+    sidebar.value.progressCurrent = Number(payload.progressCurrent || 0)
+    sidebar.value.progressTotal = Number(payload.progressTotal || 0)
+    sidebar.value.progressPercent = Number(payload.progressPercent || 0)
     sidebar.value.statusMessage = res.status === 409 ? '正在恢复已存在的分析任务...' : '任务已排队，等待 Worker 接收...'
     startPolling(id, 'ai', goal, payload.taskId)
     refreshAgentMeta(id, goal, false)
@@ -970,11 +989,15 @@ const startPolling = (id, type, goal = '', taskId = null) => {
         const status = await response.json()
         polling.failures = 0
         sidebar.value.taskState = status.state
+        sidebar.value.stage = status.stage || status.state
+        sidebar.value.progressCurrent = Number(status.progressCurrent || 0)
+        sidebar.value.progressTotal = Number(status.progressTotal || 0)
+        sidebar.value.progressPercent = Number(status.progressPercent || 0)
         const elapsedSeconds = Math.max(0, Math.floor((Date.now() - polling.startedAt) / 1000))
         const processingMessage = elapsedSeconds < 15
           ? 'Worker 已接收，正在准备视频证据...'
           : `正在执行语音转写与证据分析，已用时 ${elapsedSeconds} 秒。首次处理会比重复分析更久。`
-        sidebar.value.statusMessage = ({
+        sidebar.value.statusMessage = status.message || ({
           QUEUED: '任务已排队，等待 Worker 接收...',
           PROCESSING: processingMessage,
           RETRYING: status.message || '本次执行失败，正在等待重试...'
@@ -1029,7 +1052,7 @@ const startPolling = (id, type, goal = '', taskId = null) => {
         sidebar.value.content = '任务仍在后台执行，可稍后重新打开或刷新页面查看结果。'
       }
     }
-  }, 300000)
+  }, 900000)
   pollingTimers.set(id, polling)
   poll()
 }
@@ -1043,6 +1066,10 @@ const openSidebar = (type, title) => {
   sidebar.value.content = ''
   sidebar.value.taskId = null
   sidebar.value.taskState = null
+  sidebar.value.stage = null
+  sidebar.value.progressCurrent = 0
+  sidebar.value.progressTotal = 0
+  sidebar.value.progressPercent = 0
   sidebar.value.statusMessage = ''
 }
 
@@ -1081,6 +1108,10 @@ const createAgentState = (item) => ({
     feedback: null,
     taskId: null,
     taskState: null,
+    stage: null,
+    progressCurrent: 0,
+    progressTotal: 0,
+    progressPercent: 0,
     statusMessage: '',
     historyLoaded: false
 })
@@ -1132,6 +1163,10 @@ const restoreAgentState = async (item) => {
       sidebar.value.goal = report.goal || memory?.goal || item.analysisGoal || DEFAULT_GOAL
       sidebar.value.taskId = report.taskId || null
       sidebar.value.taskState = report.state
+      sidebar.value.stage = report.stage || report.state
+      sidebar.value.progressCurrent = Number(report.progressCurrent || 0)
+      sidebar.value.progressTotal = Number(report.progressTotal || 0)
+      sidebar.value.progressPercent = Number(report.progressPercent || 0)
       sidebar.value.content = normalizeModelText(report.report || '')
       sidebar.value.evaluation = report.evaluation || null
       sidebar.value.trace = report.trace || null
@@ -1637,6 +1672,11 @@ html, body, #app {
 .agent-run-btn:disabled, .follow-up-box button:disabled { opacity: 0.4; cursor: not-allowed; }
 .agent-running { display: flex; flex-direction: column; gap: 20px; }
 .agent-running .loading-state { min-height: 210px; height: auto; }
+.agent-progress-message { min-height: 1.5em; }
+.progress-status { width: min(100%, 420px); margin: 4px auto 0; }
+.progress-label { display: flex; justify-content: space-between; gap: 12px; color: var(--text-sub); font-size: 0.78rem; margin-bottom: 7px; }
+.progress-track { height: 5px; overflow: hidden; border-radius: 99px; background: #252a32; }
+.progress-fill { height: 100%; min-width: 2px; border-radius: inherit; background: var(--accent-lime); transition: width 0.35s ease; }
 .agent-inspector { margin-top: 28px; border-top: 1px solid var(--border-tech); padding-top: 20px; }
 .agent-meta-block { margin-bottom: 18px; padding: 14px; background: #0c0e12; border-left: 2px solid var(--accent-lime); }
 .meta-label { display: block; color: var(--accent-lime); font-size: 0.78rem; font-weight: 700; margin-bottom: 10px; }

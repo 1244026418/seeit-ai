@@ -21,6 +21,13 @@ services:
     ports:
       - "6379:6379"
 
+  qdrant:
+    image: qdrant/qdrant:v1.18.3
+    ports:
+      - "6333:6333"
+    volumes:
+      - seeit_qdrant:/qdrant/storage
+
   rmqnamesrv:
     image: apache/rocketmq:4.9.4
     command: sh mqnamesrv
@@ -48,9 +55,10 @@ services:
       ROCKETMQ_NAMESERVER: rmqnamesrv:9876
       ROCKETMQ_TOPIC: video-analysis-topic
       BILIBILI_IMPORT_ENABLED: "true"
-      BILIBILI_MAX_DURATION_SECONDS: "600"
+      BILIBILI_MAX_DURATION_SECONDS: ${BILIBILI_MAX_DURATION_SECONDS:-900}
       BILIBILI_MAX_FILE_BYTES: "536870912"
       BILIBILI_IMPORT_ATTEMPTS: "3"
+      MAX_VIDEO_DURATION_SECONDS: ${MAX_VIDEO_DURATION_SECONDS:-900}
       JWT_SECRET: change-this-before-deploying
       AUTO_CREATE_SCHEMA: "false"
       UPLOAD_ROOT: /data/uploads
@@ -60,17 +68,37 @@ services:
       AI_MODEL: ${AI_MODEL:-deepseek-v4-flash}
       AI_THINKING_MODE: ${AI_THINKING_MODE:-disabled}
       AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-180}
+      AI_INPUT_COST_PER_MILLION_TOKENS: ${AI_INPUT_COST_PER_MILLION_TOKENS:-0}
+      AI_OUTPUT_COST_PER_MILLION_TOKENS: ${AI_OUTPUT_COST_PER_MILLION_TOKENS:-0}
+      AI_CACHE_HIT_INPUT_COST_PER_MILLION_TOKENS: ${AI_CACHE_HIT_INPUT_COST_PER_MILLION_TOKENS:-0}
       AGENT_MAX_TOOL_STEPS: ${AGENT_MAX_TOOL_STEPS:-8}
       AGENT_MEMORY_MAX_MESSAGES: ${AGENT_MEMORY_MAX_MESSAGES:-12}
       AGENT_HISTORY_MAX_MESSAGES: ${AGENT_HISTORY_MAX_MESSAGES:-200}
+      AGENT_PIPELINE_VERSION: ${AGENT_PIPELINE_VERSION:-structured-v5}
+      EVIDENCE_RETRIEVER_PROFILE: ${EVIDENCE_RETRIEVER_PROFILE:-coverage-aware-qdrant-hybrid-v2}
+      EVIDENCE_RETRIEVAL_FALLBACK_ENABLED: ${EVIDENCE_RETRIEVAL_FALLBACK_ENABLED:-true}
+      EVIDENCE_ABSTENTION_ENABLED: ${EVIDENCE_ABSTENTION_ENABLED:-true}
+      EVIDENCE_MIN_DENSE_SCORE: ${EVIDENCE_MIN_DENSE_SCORE:-0.45}
+      EVIDENCE_MIN_LEXICAL_SCORE: ${EVIDENCE_MIN_LEXICAL_SCORE:-0.18}
+      EVIDENCE_EMBEDDING_MODEL_DIR: /data/models/retrieval/bge-small-zh-v1.5
+      EVIDENCE_EMBEDDING_ALLOW_DOWNLOAD: ${EVIDENCE_EMBEDDING_ALLOW_DOWNLOAD:-true}
+      EVIDENCE_EMBEDDING_CPU_THREADS: ${EVIDENCE_EMBEDDING_CPU_THREADS:-2}
+      EVIDENCE_EMBEDDING_BATCH_SIZE: ${EVIDENCE_EMBEDDING_BATCH_SIZE:-32}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-seeit_evidence_v1}
+      QDRANT_TIMEOUT_SECONDS: ${QDRANT_TIMEOUT_SECONDS:-10}
     volumes:
       - seeit_uploads:/data/uploads
+      - seeit_models:/data/models
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_started
       rmqbroker:
+        condition: service_started
+      qdrant:
         condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health')"]
@@ -97,7 +125,7 @@ services:
       LOCAL_ASR_INITIAL_PROMPT: 以下是中文技术视频的逐字稿，涉及 GPT、Sol、Terra、Luna、Reasoning Effort、Token 和 API。请使用自然标点。
       LOCAL_ASR_HOTWORDS: ""
       OCR_ENABLED: "true"
-      OCR_INTERVAL_SECONDS: "30"
+      OCR_INTERVAL_SECONDS: "15"
       PADDLEOCR_MODEL_ROOT: /data/models/paddlex
       PADDLEOCR_MODEL_SOURCE: bos
       PADDLEOCR_DETECTION_MODEL: PP-OCRv5_mobile_det
@@ -107,8 +135,8 @@ services:
       PADDLEOCR_ENABLE_MKLDNN: "true"
       PADDLEOCR_CONFIDENCE_THRESHOLD: "0.65"
       PADDLEOCR_DEDUP_THRESHOLD: "0.88"
-      PADDLEOCR_MIN_TEXT_LENGTH: "2"
-      PADDLEOCR_MAX_FRAMES: "20"
+      PADDLEOCR_MIN_TEXT_LENGTH: "1"
+      PADDLEOCR_MAX_FRAMES: ${PADDLEOCR_MAX_FRAMES:-60}
       PADDLEOCR_FRAME_MAX_WIDTH: "960"
       PADDLEOCR_PROCESS_TIMEOUT_SECONDS: "600"
     volumes:
@@ -138,3 +166,4 @@ volumes:
   seeit_mysql:
   seeit_uploads:
   seeit_models:
+  seeit_qdrant:

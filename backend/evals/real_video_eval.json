@@ -1,0 +1,221 @@
+{
+  "schemaVersion": "1.0",
+  "datasetId": "seeit-real-videos-v1",
+  "description": "SeeIt AI 两条真实 B 站视频的人工标注评测集。检索金标准使用视频 ID、毫秒区间和来源，不依赖运行时 segmentId。",
+  "topK": [1, 3, 8],
+  "sourceEnum": ["ASR", "OCR", "ASR+OCR", "NONE"],
+  "videos": [
+    {
+      "videoId": "video-001",
+      "bvid": "BV1yLKw6aE9p",
+      "title": "【闪客】大大大模型哪大了？深入解读超大模型 Kimi K3 背后的技术",
+      "durationMs": 561000
+    },
+    {
+      "videoId": "video-002",
+      "bvid": "BV1smXUYSEGi",
+      "title": "大模型token究竟是啥？",
+      "durationMs": 283000
+    }
+  ],
+  "cases": [
+    {
+      "caseId": "video-001-q01",
+      "videoId": "video-001",
+      "question": "大模型的“大”字最直接的含义是什么？",
+      "type": "direct_fact",
+      "answerable": true,
+      "goldAnswer": "模型的参数量大。",
+      "requiredAnswerGroups": [["参数量大", "参数数量大"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q01-e1", "startMs": 11000, "endMs": 17000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-001-q02",
+      "videoId": "video-001",
+      "question": "Kimi K3的百万token输入输出价格是多少？",
+      "type": "ocr",
+      "answerable": true,
+      "goldAnswer": "输入价格为 $3/M input tokens，输出价格为 $15/M output tokens。",
+      "requiredAnswerGroups": [
+          ["$3/m input", "每百万输入 token 3 美元", "输入价格为3美元", "$3/百万token"],
+          ["$15/m output", "每百万输出 token 15 美元", "输出价格为15美元", "$15/百万token"]
+      ],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q02-e1", "startMs": 30000, "endMs": 45000, "sources": ["OCR"]}]
+    },
+    {
+      "caseId": "video-001-q03",
+      "videoId": "video-001",
+      "question": "关于残差问题，Kimi没有与其他模型一样，而选择的另一条路是什么？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "使用注意力残差。",
+      "requiredAnswerGroups": [["注意力残差", "attention residual"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q03-e1", "startMs": 205000, "endMs": 228000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-001-q04",
+      "videoId": "video-001",
+      "question": "这次K3模型使用了当时这篇经典论文中的什么技术？",
+      "type": "multi_evidence",
+      "answerable": true,
+      "goldAnswer": "使用了注意力残差技术。",
+      "requiredAnswerGroups": [["注意力残差", "attention residual"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [
+        {"evidenceId": "v001-q04-e1", "startMs": 205000, "endMs": 228000, "sources": ["ASR"]},
+        {"evidenceId": "v001-q04-e2", "startMs": 230000, "endMs": 237000, "sources": ["ASR"]}
+      ]
+    },
+    {
+      "caseId": "video-001-q05",
+      "videoId": "video-001",
+      "question": "Kimi K3的三种“大”分别是什么？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "参数量大（2.8T）、百万上下文长度和支持多模态。",
+      "requiredAnswerGroups": [["参数量", "参数数量"], ["百万上下文", "上下文长度"], ["多模态"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q05-e1", "startMs": 61000, "endMs": 71000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-001-q06",
+      "videoId": "video-001",
+      "question": "agent的能力公开测评中K3的表现怎么样？",
+      "type": "direct_fact",
+      "answerable": true,
+      "goldAnswer": "表现相当亮眼。",
+      "requiredAnswerGroups": [["亮眼", "很好", "表现出色", "优秀"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q06-e1", "startMs": 374000, "endMs": 380000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-001-q07",
+      "videoId": "video-001",
+      "question": "视频作者在测试 Kimi K3 模型时给了四个任务，“文生图生视频的工作流”这个任务之后的任务是什么？",
+      "type": "temporal_order",
+      "answerable": true,
+      "goldAnswer": "大模型评测。",
+      "requiredAnswerGroups": [["大模型评测", "模型评测"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q07-e1", "startMs": 459000, "endMs": 476000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-001-q08",
+      "videoId": "video-001",
+      "question": "这次测评K3的时候很多服务端超时了，作者推测可能是什么原因？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "作者推测可能是 K3 太破圈、使用人数太多，导致服务器超时或被挤爆。",
+      "requiredAnswerGroups": [["可能", "推测"], ["破圈", "热门", "使用人数太多", "服务器"]],
+      "forbiddenAnswerPatterns": ["必然是", "一定是", "确定是"],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v001-q08-e1", "startMs": 358000, "endMs": 371000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q01",
+      "videoId": "video-002",
+      "question": "是谁问了作者“大模型的token究竟是什么东西”？",
+      "type": "direct_fact",
+      "answerable": true,
+      "goldAnswer": "作者的老婆。",
+      "requiredAnswerGroups": [["老婆", "妻子"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q01-e1", "startMs": 0, "endMs": 5000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q02",
+      "videoId": "video-002",
+      "question": "视频在第19秒左右说的“这段话”指的是什么句子（出现在画面中的）？",
+      "type": "ocr",
+      "answerable": true,
+      "goldAnswer": "我喜欢唱、跳、Rap和篮球。",
+      "requiredAnswerGroups": [["唱"], ["跳"], ["rap"], ["篮球"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q02-e1", "startMs": 19000, "endMs": 36000, "sources": ["OCR"]}]
+    },
+    {
+      "caseId": "video-002-q03",
+      "videoId": "video-002",
+      "question": "视频在第60秒左右的时候让我们快速地念一下“这几个字”，是哪几个字？",
+      "type": "asr_ocr",
+      "answerable": true,
+      "goldAnswer": "旯、妁、圳、侈、邯。",
+      "requiredAnswerGroups": [["旯"], ["妁"], ["圳"], ["侈"], ["邯"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q03-e1", "startMs": 59000, "endMs": 75000, "sources": ["ASR", "OCR"]}]
+    },
+    {
+      "caseId": "video-002-q04",
+      "videoId": "video-002",
+      "question": "我们的大脑为什么喜欢把这些有含义的词语作为一个整体来对待？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "因为这样可以节省脑力。",
+      "requiredAnswerGroups": [["节省脑力", "节省认知", "减少认知负担"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q04-e1", "startMs": 71000, "endMs": 91000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q05",
+      "videoId": "video-002",
+      "question": "分词器是大模型专门拿来干什么的？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "把大段文字拆解成大小合适的一个个 token。",
+      "requiredAnswerGroups": [["拆解", "分解", "切分"], ["文字", "文本"], ["token", "词元"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q05-e1", "startMs": 108000, "endMs": 117000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q06",
+      "videoId": "video-002",
+      "question": "在DeepSeek里面“鸡蛋关羽”是几个 token？",
+      "type": "paraphrase",
+      "answerable": true,
+      "goldAnswer": "两个 token；“鸡蛋”是一个 token，“关羽”也是一个 token。",
+      "requiredAnswerGroups": [["两个", "2"], ["鸡蛋"], ["关羽"]],
+      "forbiddenAnswerPatterns": ["总计一个", "总计四个"],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q06-e1", "startMs": 205000, "endMs": 231000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q07",
+      "videoId": "video-002",
+      "question": "“苹果”的“苹”字在 Qwen 模型里是几个 token？",
+      "type": "direct_fact",
+      "answerable": true,
+      "goldAnswer": "一个 token。",
+      "requiredAnswerGroups": [["一个 token", "1个 token", "一个", "1"], ["Qwen", "通义千问"]],
+      "forbiddenAnswerPatterns": [],
+      "evidenceRequirement": "all",
+      "goldEvidence": [{"evidenceId": "v002-q07-e1", "startMs": 240000, "endMs": 248000, "sources": ["ASR"]}]
+    },
+    {
+      "caseId": "video-002-q08",
+      "videoId": "video-002",
+      "question": "视频中加密领域的 token 是什么意思？",
+      "type": "unanswerable",
+      "answerable": false,
+      "goldAnswer": "视频中没有说明加密领域 token 的含义。",
+      "requiredAnswerGroups": [["视频未明确说明", "视频没有说明", "无法从视频确定"]],
+      "forbiddenAnswerPatterns": ["加密领域的 token 是", "token 就是加密", "自行编造"],
+      "evidenceRequirement": "none",
+      "goldEvidence": []
+    }
+  ]
+}

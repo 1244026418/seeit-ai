@@ -1,0 +1,401 @@
+{
+  "schemaVersion": "1.0",
+  "datasetId": "seeit-coverage-aware-v2-final-heldout-retrieval-v1",
+  "status": "FROZEN_FINAL_HELD_OUT",
+  "sourceAnnotation": "SeeIt AI评测集相关/SeeIt AI coverage-aware v2 最终留出集检索评测标注.md",
+  "description": "SeeIt AI Coverage-Aware v2 一次性最终未见检索评测集；参考答案不参与检索评分。",
+  "topK": [
+    1,
+    3,
+    8
+  ],
+  "videos": [
+    {
+      "videoId": "coverage-final-video-001",
+      "bvid": "BV1RYKp66Ext",
+      "durationMs": 520000,
+      "heldOut": true,
+      "notes": "关于明日方舟的黑流树海的零件机制分析"
+    },
+    {
+      "videoId": "coverage-final-video-002",
+      "bvid": "BV1d3f2BqEMx",
+      "durationMs": 598000,
+      "heldOut": true,
+      "notes": "介绍明日方舟集成战略的界园树洞原理"
+    }
+  ],
+  "cases": [
+    {
+      "caseId": "coverage-final-video-001-q01",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "ASR 事实或改写",
+      "question": "相比N稀有度的加工品，R稀有度的加工品更倾向于什么？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "R的加工品更倾向于省步数以及更自由地大范围跳跃",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q01-e1",
+          "startMs": 86000,
+          "endMs": 93000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q02",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "OCR 画面文字",
+      "question": "Normal稀有度的零件有哪些？",
+      "answerable": true,
+      "sourceLabel": "OCR",
+      "referenceAnswer": "种子 血蕈 雾滚草 浪花 枯苔藓球 报废轮子 报废假肢 标准引擎 气垫底座 试作外骨骼 小八界",
+      "type": "ocr",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q02-e1",
+          "startMs": 58000,
+          "endMs": 70000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q03",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "时间指代",
+      "question": "视频第 03:49 左右是怎样评价黑流树海的狭路相逢的？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "黑流树海的狭路相逢是收益最高的节点",
+      "type": "temporal_reference",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q03-e1",
+          "startMs": 226000,
+          "endMs": 233000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q04",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "比较多证据",
+      "question": "哪些零件是培育种子可以获得，但是在迷藏节点不能获取的",
+      "answerable": true,
+      "sourceLabel": "多证据 ASR+OCR",
+      "referenceAnswer": "R稀有度的所有零件；结构性原理、“简易遥控器”；浪花、无滚草、小八戒",
+      "type": "multi_evidence",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q04-e1",
+          "startMs": 200000,
+          "endMs": 209000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q04-e2",
+          "startMs": 405000,
+          "endMs": 420000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q04-e3",
+          "startMs": 74000,
+          "endMs": 91000,
+          "sources": [
+            "OCR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q04-e4",
+          "startMs": 108000,
+          "endMs": 122000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q05",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "枚举多证据",
+      "question": "板藤有哪些获取来源？",
+      "answerable": true,
+      "sourceLabel": "多证据 ASR+OCR",
+      "referenceAnswer": "紧急、紧急不期、居民据点、50费宝箱能获取SR稀有度的零件；培育种子来获得板藤；狭路相逢中档；迷藏节点；用SR零件在失与得中换出",
+      "type": "multi_evidence",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q05-e1",
+          "startMs": 116000,
+          "endMs": 135000,
+          "sources": [
+            "OCR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e2",
+          "startMs": 116000,
+          "endMs": 120000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e3",
+          "startMs": 165000,
+          "endMs": 172000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e4",
+          "startMs": 199000,
+          "endMs": 204000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e5",
+          "startMs": 208000,
+          "endMs": 215000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e6",
+          "startMs": 259000,
+          "endMs": 269000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e7",
+          "startMs": 405000,
+          "endMs": 420000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-001-q05-e8",
+          "startMs": 478000,
+          "endMs": 490000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q06",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "ASR 事实或改写",
+      "question": "笼控器怎么获得？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "笼控器只有通过事件获得",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-001-q06-e1",
+          "startMs": 125000,
+          "endMs": 129000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-001-q07",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "不可回答",
+      "question": "黑流树海的一结局BOSS是什么？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明……",
+      "type": "unanswerable",
+      "goldEvidence": []
+    },
+    {
+      "caseId": "coverage-final-video-001-q08",
+      "videoId": "coverage-final-video-001",
+      "annotationType": "不可回答",
+      "question": "黑流树海和界园哪个好玩？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明……",
+      "type": "unanswerable",
+      "goldEvidence": []
+    },
+    {
+      "caseId": "coverage-final-video-002-q01",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "ASR 事实或改写",
+      "question": "界园的树洞是什么形状的地图？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "正方形",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-002-q01-e1",
+          "startMs": 15000,
+          "endMs": 21000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-002-q02",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "ASR 事实或改写",
+      "question": "我们推测界园树洞是用的什么算法？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "是随机普里姆算法（一种从起点开始基于已访问节点向外扩张的随机生成树算法）",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-002-q02-e1",
+          "startMs": 121000,
+          "endMs": 132000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-002-q03",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "时间指代",
+      "question": "视频第 01:00 左右的画面显示剩余烛火还有多少？",
+      "answerable": true,
+      "sourceLabel": "OCR",
+      "referenceAnswer": "4",
+      "type": "temporal_reference",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-002-q03-e1",
+          "startMs": 56000,
+          "endMs": 62000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-002-q04",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "比较多证据",
+      "question": "是非镜的 初始十字节点 比 5x5外的两行节点 多出现了哪些节点类型？",
+      "answerable": true,
+      "sourceLabel": "多证据 ASR",
+      "referenceAnswer": "多出了 传说、易与 这两类节点",
+      "type": "multi_evidence",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-002-q04-e1",
+          "startMs": 285000,
+          "endMs": 290000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-002-q04-e2",
+          "startMs": 338000,
+          "endMs": 345000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-002-q05",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "枚举多证据",
+      "question": "节点分配除了随机还有什么规则限制？",
+      "answerable": true,
+      "sourceLabel": "多证据 ASR",
+      "referenceAnswer": "一，在是非境中，抉择不与初始的四个节点相连；二，在今昔境中，只有杂疑、祸乱、故肆与初始的三个节点相连",
+      "type": "multi_evidence",
+      "goldEvidence": [
+        {
+          "evidenceId": "coverage-final-video-002-q05-e1",
+          "startMs": 363000,
+          "endMs": 369000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "coverage-final-video-002-q05-e2",
+          "startMs": 371000,
+          "endMs": 376000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "coverage-final-video-002-q06",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "不可回答",
+      "question": "界园的树洞内作战会掉落多少票卷？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明……",
+      "type": "unanswerable",
+      "goldEvidence": []
+    },
+    {
+      "caseId": "coverage-final-video-002-q07",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "不可回答",
+      "question": "界园开局选择什么分队能够更好的探索树洞是非镜？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明……",
+      "type": "unanswerable",
+      "goldEvidence": []
+    },
+    {
+      "caseId": "coverage-final-video-002-q08",
+      "videoId": "coverage-final-video-002",
+      "annotationType": "不可回答",
+      "question": "界园里想要达成五结局一定要进入树洞吗？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明……",
+      "type": "unanswerable",
+      "goldEvidence": []
+    }
+  ]
+}

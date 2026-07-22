@@ -35,7 +35,7 @@ openssl rand -hex 32
 - `LOCAL_ASR_ENABLED=true` 默认在 Worker 中启用 `faster-whisper base/int8`。首次启动会下载约 141 MB 模型到独立 Docker volume，之后复用缓存；模型不会加载到 API 或 MCP。
 - `OCR_ENABLED=true` 默认启用 PaddleOCR `PP-OCRv5_mobile_det/rec`，首次运行下载约 21 MB 模型。ASR 完成后释放 Whisper 模型，再由独立 OCR 子进程执行推理。
 - 4 核 8 GB 建议保持 `LOCAL_ASR_CPU_THREADS=4`、`WORKER_CPU_LIMIT=3.0`、`WORKER_MEMORY_LIMIT=2560m`。2 核机器建议将 CPU limit 改为 `1.5`，并可关闭 OCR 以缩短等待时间。
-- `BILIBILI_IMPORT_ENABLED=true` 时允许通过 BV 号导入公开单视频；默认限制 10 分钟、512 MB、最多重试 3 次。
+- `BILIBILI_IMPORT_ENABLED=true` 时允许通过 BV 号导入公开单视频；默认限制 15 分钟、512 MB、最多重试 3 次。
 
 大陆服务器访问官方依赖源不稳定时，可以只在生产环境文件中覆盖构建镜像源：
 
@@ -113,10 +113,10 @@ chmod +x deploy/backup-mysql.sh
 - Worker 消费线程数设置为 1，任务串行处理。
 - 4 核 8 GB 服务器使用 `WORKER_CPU_LIMIT=3.0`，为 API、数据库和消息队列保留约 1 核；2 核服务器使用 `1.0` 到 `1.5`。
 - Worker 内存上限为 2560 MiB。本地 5 分 46 秒、1080p 中文技术视频实测 Worker 总处理 98.97 秒，其中 base ASR 43.64 秒、12 帧 PaddleOCR 子进程 44.37 秒；采样峰值约 1321 MiB，距上限仍有约 1239 MiB 余量。
-- OCR 默认每 30 秒采样一帧、最长 20 帧、最大宽度 960 像素。该配置面向单用户演示，若更重视小字识别可提高宽度或采样频率，但必须重新测试耗时和内存。
+- OCR 默认每 15 秒采样一帧、最长 60 帧、最大宽度 960 像素，可覆盖允许导入的 15 分钟视频。该配置面向单用户演示，若继续提高宽度或采样频率，必须重新测试耗时和内存。
 - MySQL buffer pool 为 256 MB，Redis 上限为 192 MB。
 - RocketMQ NameServer/Broker 已限制 JVM 堆内存。
-- 单个视频默认不超过 512 MB、时长不超过 10 分钟。
+- BV 导入视频默认不超过 512 MB、时长不超过 15 分钟；普通上传与 BV 导入的默认时长上限统一为 15 分钟，仍可分别通过 `MAX_VIDEO_DURATION_SECONDS` 和 `BILIBILI_MAX_DURATION_SECONDS` 配置。
 - 首次模型下载期间查看 Worker 日志；若 Hugging Face 网络不稳定，可在可信网络预下载同一模型并复制到 `seeit_prod_models` volume。
 - 如果服务器内存持续超过 80%，先关闭 OCR、降低抽帧数量、减少日志和清理历史上传，再考虑升级机器。
 

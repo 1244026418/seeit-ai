@@ -1,0 +1,284 @@
+{
+  "schemaVersion": "1.0",
+  "datasetId": "seeit-heldout-retrieval-v1",
+  "status": "FROZEN_HELD_OUT",
+  "sourceAnnotation": "C:\\Users\\12440\\Desktop\\code\\new\\SeeIt AI评测集相关\\SeeIt AI held-out检索评测标注模板.md",
+  "description": "SeeIt AI 独立 held-out 视频检索标注；参考答案不参与检索评分。",
+  "topK": [
+    1,
+    3,
+    8
+  ],
+  "videos": [
+    {
+      "videoId": "heldout-video-001",
+      "bvid": "BV1TGKV6PEdf",
+      "durationMs": 269000,
+      "heldOut": true,
+      "notes": "科普视频，主题是面试 Agent的Checkpoint机制，全程自带字幕"
+    },
+    {
+      "videoId": "heldout-video-002",
+      "bvid": "BV1tiKU6eEuU",
+      "durationMs": 734000,
+      "heldOut": true,
+      "notes": "科普视频，主题为LangChain和LangGraph有什么区别，全程自带字幕"
+    }
+  ],
+  "cases": [
+    {
+      "caseId": "heldout-video-001-q01",
+      "videoId": "heldout-video-001",
+      "annotationType": "ASR 事实或改写",
+      "question": "如果你在面试官问Agent的Checkpoint机制的时候，只说保存状态，面试官会把你怎么样？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "面试官嘴上不说，心里已经划到没上过生产那一档了",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-001-q01-e1",
+          "startMs": 1000,
+          "endMs": 12000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-001-q02",
+      "videoId": "heldout-video-001",
+      "annotationType": "ASR 事实或改写",
+      "question": "Time Travel是什么？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "是指获得从任意历史 Checkpoint 恢复执行的能力，",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-001-q02-e1",
+          "startMs": 190000,
+          "endMs": 196000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-001-q03",
+      "videoId": "heldout-video-001",
+      "annotationType": "OCR 画面文字",
+      "question": "画面中 Jack 后面的标注是什么？",
+      "answerable": true,
+      "sourceLabel": "OCR",
+      "referenceAnswer": "@ Agent Dev",
+      "type": "ocr",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-001-q03-e1",
+          "startMs": 1000,
+          "endMs": 20000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-001-q04",
+      "videoId": "heldout-video-001",
+      "annotationType": "OCR 画面文字",
+      "question": "生命周期架构(TTL)的工程法则是什么",
+      "answerable": true,
+      "sourceLabel": "OCR",
+      "referenceAnswer": "全量覆盖+冗灾余量",
+      "type": "ocr",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-001-q04-e1",
+          "startMs": 122000,
+          "endMs": 145000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-001-q05",
+      "videoId": "heldout-video-001",
+      "annotationType": "ASR+OCR 联合",
+      "question": "视频以什么真实事件说明 State 强制溯源的重要性？任务从 Checkpoint 恢复后若直接根据最新内存重放旧订票逻辑，会导致什么问题？",
+      "answerable": true,
+      "sourceLabel": "ASR + OCR",
+      "referenceAnswer": "真实血案：航司抢票场景的挂起/恢复重入；恢复后按最新内存重放旧订票逻辑，可能因余座已变化造成时序和状态错乱。",
+      "type": "asr_ocr",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-001-q05-e1",
+          "startMs": 155000,
+          "endMs": 185000,
+          "sources": [
+            "OCR"
+          ]
+        },
+        {
+          "evidenceId": "heldout-video-001-q05-e2",
+          "startMs": 170000,
+          "endMs": 185000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-001-q06",
+      "videoId": "heldout-video-001",
+      "annotationType": "不可回答",
+      "question": "Agent 的 RAG是什么",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明",
+      "type": "unanswerable",
+      "goldEvidence": []
+    },
+    {
+      "caseId": "heldout-video-002-q01",
+      "videoId": "heldout-video-002",
+      "annotationType": "ASR 事实或改写",
+      "question": "LangChain有哪两个致命硬伤（局限）？",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "一：无纠错机制。二：循环能力生硬，无法灵活回头。",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-002-q01-e1",
+          "startMs": 262000,
+          "endMs": 302000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-002-q02",
+      "videoId": "heldout-video-002",
+      "annotationType": "ASR 事实或改写",
+      "question": "LangGraph和普通流水线之间最本质的区别是什么",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "有在运行中能够自主纠错和循环的能力",
+      "type": "asr_fact_or_paraphrase",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-002-q02-e1",
+          "startMs": 157000,
+          "endMs": 180000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-002-q03",
+      "videoId": "heldout-video-002",
+      "annotationType": "时间指代",
+      "question": "作者在视频 02:25 左右的时候，把LangChain比作成了什么",
+      "answerable": true,
+      "sourceLabel": "ASR",
+      "referenceAnswer": "单项执行的工厂流水线",
+      "type": "temporal_reference",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-002-q03-e1",
+          "startMs": 137000,
+          "endMs": 158000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-002-q04",
+      "videoId": "heldout-video-002",
+      "annotationType": "OCR 画面文字",
+      "question": "LangGraph机制二： 全局状态管理 的价值是什么？",
+      "answerable": true,
+      "sourceLabel": "OCR",
+      "referenceAnswer": "打破节点隔离，任务数据集中维护与持久化。",
+      "type": "ocr",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-002-q04-e1",
+          "startMs": 415000,
+          "endMs": 438000,
+          "sources": [
+            "OCR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-002-q05",
+      "videoId": "heldout-video-002",
+      "annotationType": "ASR多证据推理",
+      "question": "LangGraph有哪四个底层的硬核机制？",
+      "answerable": true,
+      "sourceLabel": "多证据",
+      "referenceAnswer": "机制一： 灵活的循环控制。机制二： 全局状态管理。机制三：Reducer规约机制。机制四： Checkpoint快照机制。",
+      "type": "multi_evidence",
+      "goldEvidence": [
+        {
+          "evidenceId": "heldout-video-002-q05-e1",
+          "startMs": 345000,
+          "endMs": 353000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "heldout-video-002-q05-e2",
+          "startMs": 405000,
+          "endMs": 411000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "heldout-video-002-q05-e3",
+          "startMs": 457000,
+          "endMs": 463000,
+          "sources": [
+            "ASR"
+          ]
+        },
+        {
+          "evidenceId": "heldout-video-002-q05-e4",
+          "startMs": 490000,
+          "endMs": 496000,
+          "sources": [
+            "ASR"
+          ]
+        }
+      ]
+    },
+    {
+      "caseId": "heldout-video-002-q06",
+      "videoId": "heldout-video-002",
+      "annotationType": "不可回答",
+      "question": "LangGraph和Dify有什么区别？",
+      "answerable": false,
+      "sourceLabel": "无",
+      "referenceAnswer": "视频中没有说明",
+      "type": "unanswerable",
+      "goldEvidence": []
+    }
+  ]
+}

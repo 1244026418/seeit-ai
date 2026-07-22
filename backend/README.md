@@ -45,7 +45,7 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 - 使用 PaddlePaddle `3.2.2` 与 PaddleOCR `3.7.0` 的 `PP-OCRv5_mobile_det/rec` 抽取关键帧文字；ASR 后释放 Whisper 模型，并通过独立 OCR 子进程规避 CPU oneDNN 的非主线程限制，将 ASR/OCR 统一写入 EvidenceSegment 时间轴。
 - 发现历史媒体只有 SYSTEM 占位证据时，在 ASR 可用后自动重新构建时间轴；抽取式报告按型号、推理强度、价格、适用场景和建议等目标维度检索，并保留全片时间轴锚点。
 - 抽象 OpenAI 兼容 AI Provider，同时提供离线 Mock，方便无密钥演示。
-- 内置 LangGraph 有状态 Agent 图，复用元数据、时间轴检索、证据窗口、引用校验和报告生成工具；真实模型通过 Function Calling 自主选择工具，Mock 模式执行确定性工具流水线。
+- 默认启用 LangGraph v5.1 结构化 Agent：LLM Planner 生成最多 6 个证据槽位，Retriever 批量构建最多 18 条压缩 Evidence Ledger，Verifier 逐槽位判断直接支持与完整性并允许一次假阴性/悬空指代审计，Writer 只能引用合法 Evidence ID，独立 Critic 检查漏项、矛盾、外部知识和拒答；一次修订后使用确定性门禁有界收尾，`AGENT_PIPELINE_VERSION=legacy-v4` 可回滚旧工具循环。
 - 独立 Evidence Retriever 提供关键词/字符片段混合基线，输出分数明细；`backend/evals/evidence_rag_eval.json` 和脚本统计 Recall@K、MRR、Hit Rate。
 - 输出带时间戳证据的 Markdown 报告，并持久化动态计划、逐工具 Trace、图执行元数据、阶段耗时、引用支持率、继续追问和用户反馈；MySQL 使用 `LONGTEXT` 保存真实多轮工具调用 Trace。
 - 按用户、视频和分析目标持久化 AgentSession/AgentMessage；模型追问上下文默认取最近 12 条，历史查看每会话默认返回最近 200 条并标记是否截断。`GET /analysis/agent-memory` 同时返回最新会话和该视频的全部会话列表，`GET /media/list` 返回会话/消息计数与最近回复摘要，支持前端关闭后恢复和主页历史展示。
@@ -56,7 +56,7 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 
 ## 当前验证边界
 
-项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。Evidence RAG 当前是确定性的关键词/字符片段基线，9 条合成用例的指标不能代表真实视频召回率；向量 Embedding 和 Qdrant 属于下一阶段。PaddleOCR 只负责画面文字识别，不等同于通用视觉语义理解；RocketMQ 需要 Linux/Docker 动态库，B 站导入依赖对方公开 API、CDN 与格式，平台策略变化时仍可能需要升级 `yt-dlp` 或接口适配。对外描述时应以代码和测试能够验证的能力为准。
+项目当前以完整业务流程和面试演示为目标，尚未提供生产吞吐量、消息零丢失或大规模并发数据。Evidence RAG 已提供 lexical、BGE dense、Hybrid RRF、Contextual、Coverage-Aware 和可选 Qdrant Profile；Coverage-Aware 会拆分多问句/枚举/分别题，返回 `coveragePlan/evidenceSufficiency`，并在当前视频缺少高精度锚点时拒答。开发集指标不能代表通用视频召回率；在 2 视频 16 题的冻结 v2 最终未见集上，Coverage-Aware 的 MRR/Recall@8 为 `0.4651/0.5909`，低于 lexical 的 `0.5682/0.6818`，5 道不可回答题也全部误召回。PaddleOCR 只负责画面文字识别，不等同于通用视觉语义理解；RocketMQ 需要 Linux/Docker 动态库，B 站导入依赖对方公开 API、CDN 与格式，平台策略变化时仍可能需要升级 `yt-dlp` 或接口适配。对外描述时应以代码和测试能够验证的能力为准。
 
 服务器部署使用根目录的 `docker-compose.prod.yml`，详细步骤见 [`deploy/README.md`](../deploy/README.md)。
 
@@ -80,7 +80,7 @@ HTTP 客户端必须在 `Authorization: Bearer <token>` 请求头中携带网站
 
 ## 后续改进顺序
 
-1. 在当前 Retriever 接口上增加可选 Embedding 检索和 Qdrant Profile，与关键词基线比较 Recall@K、MRR 和延迟。
-2. 为 Prompt、模型、工具策略和 Agent 图版本建立评测记录，增加真实视频人工标注集和 Provider 失败场景回归。
+1. 封存 v2 最终集，不再重跑或据此调参；只在既有开发集、合成/变形用例和 shadow case 上扩充 v5 Planner/Verifier/Critic 契约。
+2. 按 `PLANNER/VERIFIER/WRITER/CRITIC` 聚合 Provider Usage，持续观察上下文压缩、修订率和拒答误判；评测预算参数默认仍为 0（无限制）。
 3. 在 GitHub Actions 中启动 MySQL、Redis 和 RocketMQ，增加真实组件集成测试与 Agent 评测门禁。
 4. 增加 Token、成本、模型延迟、工具失败、记忆命中和队列积压等可观测指标。

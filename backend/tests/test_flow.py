@@ -9,6 +9,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -97,6 +98,10 @@ def test_register_upload_analyze_evaluate_and_feedback() -> None:
             time.sleep(0.05)
         assert status["state"] == "COMPLETED"
         assert status["taskId"] == task_id
+        assert status["stage"] == "COMPLETED"
+        assert status["progressCurrent"] == 1
+        assert status["progressTotal"] == 1
+        assert status["progressPercent"] == 100
         assert "[00:01] ASR" in status["result"]
 
         plan = client.get("/analysis/agent-plan", params={"id": media_id, "goal": goal}, headers=headers).json()
@@ -117,7 +122,12 @@ def test_register_upload_analyze_evaluate_and_feedback() -> None:
         task_status = client.get("/analysis/task-status", params={"taskId": task_id}, headers=headers).json()
         report = client.get("/analysis/report", params={"id": media_id, "goal": goal}, headers=headers).json()
         assert task_status["state"] == "COMPLETED"
+        assert task_status["answerable"] is True
+        assert task_status["finalAnswer"]
         assert report["report"] == status["result"]
+        assert report["finalAnswer"] == task_status["finalAnswer"]
+        assert task_status["trace"]["providerUsage"]["requestCount"] == 0
+        assert task_status["trace"]["providerRequests"] == []
 
         transcription = client.get("/analysis/transcription-status", params={"id": media_id}, headers=headers).json()
         assert transcription["state"] == "COMPLETED"
@@ -311,7 +321,18 @@ def test_paddle_ocr_content_filters_low_confidence_and_short_text(
         }
     }
 
-    assert ocr_runner.paddle_ocr_content(payload, 0.65) == "GPT-5.6 Sol 每100万输入Token 5美元"
+    assert ocr_runner.paddle_ocr_content(payload, 0.65, min_length=2) == "GPT-5.6 Sol 每100万输入Token 5美元"
+
+
+def test_paddle_ocr_content_can_preserve_single_chinese_characters() -> None:
+    payload = {
+        "res": {
+            "rec_texts": ["我喜欢", "唱", "跳", "Rap和", "篮球"],
+            "rec_scores": [0.99, 0.98, 0.97, 0.99, 0.99],
+        }
+    }
+
+    assert ocr_runner.paddle_ocr_content(payload, 0.65) == "我喜欢 唱 跳 Rap和 篮球"
 
 
 def test_ocr_runner_reads_png_and_jpeg_frames(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -334,10 +355,12 @@ def test_ocr_runner_reads_png_and_jpeg_frames(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setitem(sys.modules, "paddleocr", fake_module)
     monkeypatch.setenv("PADDLEOCR_MODEL_ROOT", str(TEST_ROOT / "paddlex-models"))
 
-    payload = ocr_runner.run(frame_dir)
+    progress_file = frame_dir / "progress.json"
+    payload = ocr_runner.run(frame_dir, progress_file)
 
     assert payload["frameCount"] == 2
     assert [item["frame"] for item in payload["results"]] == ["frame-000001.png", "frame-000002.jpg"]
+    assert json.loads(progress_file.read_text(encoding="utf-8")) == {"current": 2, "total": 2}
 
 
 def test_paddle_ocr_runs_in_isolated_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -396,15 +419,27 @@ def test_deepseek_payload_uses_thinking_mode_and_standard_tool_calls(
     captured: dict[str, object] = {}
 
     class FakeResponse:
+        status_code = 200
+        headers = {"x-request-id": "request-usage-1"}
+
         def raise_for_status(self) -> None:
             pass
 
         def json(self) -> dict:
-            return {"choices": [{"message": {"content": None, "tool_calls": [{
-                "id": "call-1",
-                "type": "function",
-                "function": {"name": "get_video_metadata", "arguments": "{}"},
-            }]}}]}
+            return {
+                "choices": [{"message": {"content": None, "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "get_video_metadata", "arguments": "{}"},
+                }]}}],
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 500,
+                    "total_tokens": 1500,
+                    "prompt_cache_hit_tokens": 200,
+                    "prompt_cache_miss_tokens": 800,
+                },
+            }
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         captured["url"] = url
@@ -413,6 +448,9 @@ def test_deepseek_payload_uses_thinking_mode_and_standard_tool_calls(
 
     monkeypatch.setenv("AI_THINKING_MODE", "disabled")
     monkeypatch.setenv("AI_REQUEST_TIMEOUT_SECONDS", "180")
+    monkeypatch.setenv("AI_INPUT_COST_PER_MILLION_TOKENS", "2")
+    monkeypatch.setenv("AI_OUTPUT_COST_PER_MILLION_TOKENS", "8")
+    monkeypatch.setenv("AI_CACHE_HIT_INPUT_COST_PER_MILLION_TOKENS", "1")
     monkeypatch.setattr(main.httpx, "post", fake_post)
     provider = main.OpenAICompatibleProvider(
         "https://api.deepseek.com",
@@ -434,6 +472,53 @@ def test_deepseek_payload_uses_thinking_mode_and_standard_tool_calls(
     assert captured["json"]["thinking"] == {"type": "disabled"}
     assert captured["json"]["tool_choice"] == "auto"
     assert message["tool_calls"][0]["function"]["name"] == "get_video_metadata"
+    usage = provider.provider_usage_summary()
+    assert usage["requestCount"] == 1
+    assert usage["promptTokens"] == 1000
+    assert usage["completionTokens"] == 500
+    assert usage["totalTokens"] == 1500
+    assert usage["cacheHitTokens"] == 200
+    assert usage["estimatedCostUsd"] == 0.0058
+    assert provider.provider_usage_events()[0]["requestId"] == "request-usage-1"
+    assert provider.provider_usage_events()[0]["phase"] == "UNSPECIFIED"
+    assert usage["byPhase"]["UNSPECIFIED"]["totalTokens"] == 1500
+
+    nested_cache_tokens = provider._usage_tokens({
+        "prompt_tokens": 120,
+        "completion_tokens": 30,
+        "total_tokens": 150,
+        "prompt_tokens_details": {"cached_tokens": 20},
+    })
+    assert nested_cache_tokens["cacheHitTokens"] == 20
+    assert nested_cache_tokens["cacheMissTokens"] == 100
+    assert provider._usage_tokens({"unexpected": 1})["usageReported"] is False
+    monkeypatch.setenv("AI_OUTPUT_COST_PER_MILLION_TOKENS", "0")
+    assert provider._token_cost(nested_cache_tokens) is None
+
+
+def test_provider_usage_records_failed_http_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = httpx.Request("POST", "https://api.example.com/chat/completions")
+
+    class FailedResponse:
+        status_code = 503
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            response = httpx.Response(503, request=request)
+            raise httpx.HTTPStatusError("service unavailable", request=request, response=response)
+
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: FailedResponse())
+    provider = main.OpenAICompatibleProvider("https://api.example.com", "test-key", "test-model")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        provider._completion([{"role": "user", "content": "test"}])
+
+    usage = provider.provider_usage_summary()
+    assert usage["requestCount"] == 1
+    assert usage["successCount"] == 0
+    assert usage["failureCount"] == 1
+    assert usage["totalTokens"] == 0
+    assert provider.provider_usage_events()[0]["statusCode"] == 503
 
 
 def test_report_normalization_does_not_split_string_fields_into_characters() -> None:
@@ -555,6 +640,23 @@ def test_rocketmq_producer_uses_supported_nameserver_api(monkeypatch: pytest.Mon
 def test_failed_analysis_retries_then_becomes_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingProvider(main.Provider):
         def analyze(self, transcript: str, goal: str) -> dict:
+            self._record_provider_usage({
+                "provider": self.__class__.__name__,
+                "model": "test-model",
+                "success": False,
+                "statusCode": 503,
+                "latencyMs": 10,
+                "promptTokens": 100,
+                "completionTokens": 0,
+                "totalTokens": 100,
+                "cacheHitTokens": 0,
+                "cacheMissTokens": 100,
+                "usageReported": True,
+                "estimatedCostUsd": 0.001,
+                "toolCallCount": 0,
+                "requestId": None,
+                "errorType": "RuntimeError",
+            })
             raise RuntimeError("模型暂时不可用")
 
         def follow_up(self, report: str, question: str) -> str:
@@ -575,9 +677,46 @@ def test_failed_analysis_retries_then_becomes_terminal(monkeypatch: pytest.Monke
             assert task.state == "FAILED"
             assert task.attempt_count == 3
             assert task.active_key is None
+            trace = json.loads(task.trace_json)
+            assert trace["providerUsage"]["requestCount"] == 3
+            assert trace["providerUsage"]["totalTokens"] == 300
+            assert trace["providerUsage"]["estimatedCostUsd"] == 0.003
+            assert [item["attempt"] for item in trace["providerRequests"]] == [1, 2, 3]
+
+
+def test_agent_quality_gate_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    class QualityGateProvider(main.Provider):
+        def analyze(self, transcript: str, goal: str) -> dict:
+            return {}
+
+        def follow_up(self, report: str, question: str) -> str:
+            return ""
+
+        def run_agent(self, toolbox: main.AgentToolbox, goal: str) -> dict:
+            raise main.AgentQualityGateError("安全收尾失败")
+
+    with TestClient(main.app) as client:
+        headers = register(client, "quality_gate")
+        media_id = upload(client, headers, b"quality-gate-video")
+        monkeypatch.setattr(main, "publish_analysis", lambda task_id: None)
+        monkeypatch.setattr(main, "provider", lambda: QualityGateProvider())
+        task_id = client.post(
+            "/analysis/ai",
+            params={"id": media_id, "goal": "质量门禁"},
+            headers=headers,
+        ).json()["taskId"]
+
+        assert main.process_analysis(task_id) == "FAILED"
+        assert main.process_analysis(task_id) == "SKIPPED"
+        with main.SessionLocal() as db:
+            task = db.get(main.AnalysisTask, task_id)
+            assert task is not None
+            assert task.attempt_count == 1
+            assert task.active_key is None
 
 
 def test_openai_compatible_provider_executes_model_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_PIPELINE_VERSION", "legacy-v4")
     toolbox = main.AgentToolbox(
         metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
         segments=[{
@@ -617,6 +756,7 @@ def test_openai_compatible_provider_executes_model_tool_calls(monkeypatch: pytes
     assert result["agentGraph"]["intent"] == "OPERATION_GUIDE"
     assert result["agentGraph"]["steps"] == 3
     assert [item["tool"] for item in toolbox.trace()] == [
+        "search_timeline",
         "get_video_metadata",
         "search_timeline",
         "get_evidence_window",
@@ -625,6 +765,7 @@ def test_openai_compatible_provider_executes_model_tool_calls(monkeypatch: pytes
 
 
 def test_langgraph_revises_report_after_critic_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_PIPELINE_VERSION", "legacy-v4")
     toolbox = main.AgentToolbox(
         metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
         segments=[{
@@ -665,12 +806,17 @@ def test_langgraph_revises_report_after_critic_rejection(monkeypatch: pytest.Mon
     assert result["accepted"] is True
     assert result["report"]["title"] == "修订后的报告"
     assert result["agentGraph"]["steps"] == 2
-    assert [item["resultPreview"].find('"accepted":false') >= 0 for item in toolbox.trace()] == [True, False]
+    report_traces = [item for item in toolbox.trace() if item["tool"] == "generate_report"]
+    assert [
+        item["resultPreview"].find('"accepted":false') >= 0
+        for item in report_traces
+    ] == [True, False]
 
 
-def test_langgraph_does_not_return_report_rejected_at_step_budget(
+def test_langgraph_budget_closeout_falls_back_to_explicit_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("AGENT_PIPELINE_VERSION", "legacy-v4")
     toolbox = main.AgentToolbox(
         metadata={"mediaId": 1, "filename": "course.mp4", "status": "COMPLETED"},
         segments=[],
@@ -693,8 +839,80 @@ def test_langgraph_does_not_return_report_rejected_at_step_budget(
     monkeypatch.setenv("AGENT_MAX_TOOL_STEPS", "3")
     monkeypatch.setattr(provider, "_completion", lambda messages, tools=None: rejected)
 
-    with pytest.raises(RuntimeError, match="未通过 Critic 校验"):
-        provider.run_agent(toolbox, "总结视频")
+    result = provider.run_agent(toolbox, "总结视频")
+
+    assert result["accepted"] is True
+    assert result["report"]["answerable"] is False
+    assert "无法从视频确定" in result["report"]["finalAnswer"]
+    assert result["agentGraph"]["finalizeCalls"] == 2
+
+
+def test_unanswerable_report_accepts_refusal_and_rejects_external_fact() -> None:
+    refusal = main.normalize_analysis_result({
+        "answerable": False,
+        "finalAnswer": "视频中没有说明加密领域 token 的含义。",
+        "title": "视频未说明",
+        "conclusions": ["无法从视频确定该问题的答案。"],
+        "evidence": [],
+        "suggestions": [],
+    })
+    invented = main.normalize_analysis_result({
+        **refusal,
+        "finalAnswer": "视频中没有说明，不过加密领域的 token 通常是数字资产。",
+    })
+    cited_refusal = main.normalize_analysis_result({
+        **refusal,
+        "evidence": [{"timestampMs": 0, "source": "ASR", "content": "大模型 token"}],
+    })
+
+    assert main.evaluate_result(refusal, [])["criticPassed"] is True
+    assert main.evaluate_result(refusal, [])["citationCount"] == 0
+    assert main.evaluate_result(invented, [])["criticPassed"] is False
+    assert main.evaluate_result(cited_refusal, [{
+        "segmentId": "asr-1",
+        "source": "ASR",
+        "startMs": 0,
+        "endMs": 1000,
+        "content": "大模型 token",
+    }])["criticPassed"] is False
+
+
+def test_generate_report_prunes_unsupported_citations_before_rejecting() -> None:
+    toolbox = main.AgentToolbox(
+        metadata={"mediaId": 1},
+        segments=[{
+            "segmentId": "asr-1",
+            "source": "ASR",
+            "startMs": 5000,
+            "endMs": 9000,
+            "content": "公开测评中 K3 的表现相当亮眼。",
+        }],
+        normalize_report=main.normalize_analysis_result,
+        evaluate_report=main.evaluate_result,
+    )
+
+    result = toolbox.execute("generate_report", {
+        "answerable": True,
+        "finalAnswer": "K3 的表现相当亮眼。",
+        "title": "公开测评表现",
+        "conclusions": ["K3 的表现相当亮眼。"],
+        "evidence": [
+            {"timestampMs": 5000, "source": "ASR", "content": "公开测评中 K3 的表现相当亮眼。"},
+            {"timestampMs": 99000, "source": "OCR", "content": "不存在的排行榜"},
+        ],
+        "suggestions": [],
+    })
+
+    assert result["accepted"] is True
+    assert len(result["report"]["evidence"]) == 1
+    assert result["evaluation"]["citationRepairApplied"] is True
+    assert result["evaluation"]["discardedCitationCount"] == 1
+
+
+def test_qualitative_how_question_is_not_misclassified_as_operation_guide() -> None:
+    plan = main.build_plan("Agent 能力公开测评中 K3 的表现怎么样？")
+
+    assert plan["intent"] == "EVIDENCE_QA"
 
 
 def test_chunk_size_and_authentication_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -861,6 +1079,12 @@ def test_ffprobe_video_validation_and_duration_limit(monkeypatch: pytest.MonkeyP
     with pytest.raises(ValueError, match="视频时长不能超过"):
         main.validate_video_file(Path("too-long.mp4"))
 
+    overridden = main.validate_video_file(
+        Path("bilibili-long.mp4"),
+        max_duration_seconds=900,
+    )
+    assert overridden["durationSeconds"] == 601.0
+
 
 def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert main.normalize_bvid("https://www.bilibili.com/video/BV1xx411c7mD?p=1") == "BV1xx411c7mD"
@@ -883,7 +1107,11 @@ def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: py
         assert response.status_code == 200
         assert response.json()["title"] == "公开课程视频"
 
-        monkeypatch.setattr(main, "fetch_bilibili_metadata", lambda _: {**metadata, "durationSeconds": 601})
+        monkeypatch.setattr(
+            main,
+            "fetch_bilibili_metadata",
+            lambda _: {**metadata, "durationSeconds": main.BILIBILI_MAX_DURATION_SECONDS + 1},
+        )
         response = client.post("/media/bilibili/preview", json={"bvid": "BV1xx411c7mD"}, headers=headers)
         assert response.status_code == 400
         assert "时长" in response.json()["detail"]
@@ -891,11 +1119,13 @@ def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: py
 
 def test_bilibili_import_is_idempotent_and_enters_media_library(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main, "publish_bilibili_import", lambda task_id: None)
-    monkeypatch.setattr(
-        main,
-        "validate_video_file",
-        lambda path: {"codec": "h264", "durationSeconds": 30.0, "width": 1280, "height": 720},
-    )
+    validation_limits: list[int | None] = []
+
+    def fake_validate(path: Path, *, max_duration_seconds: int | None = None) -> dict:
+        validation_limits.append(max_duration_seconds)
+        return {"codec": "h264", "durationSeconds": 30.0, "width": 1280, "height": 720}
+
+    monkeypatch.setattr(main, "validate_video_file", fake_validate)
 
     def fake_download(value: str, directory: Path) -> DownloadedVideo:
         directory.mkdir(parents=True, exist_ok=True)
@@ -932,6 +1162,7 @@ def test_bilibili_import_is_idempotent_and_enters_media_library(monkeypatch: pyt
         assert duplicate.json()["taskId"] == task_id
 
         assert main.process_bilibili_import(task_id) == "COMPLETED"
+        assert validation_limits == [main.BILIBILI_MAX_DURATION_SECONDS]
         status = client.get(
             "/media/bilibili/import-status",
             params={"taskId": task_id},
