@@ -113,7 +113,7 @@ def test_register_upload_analyze_evaluate_and_feedback() -> None:
         assert trace["agentMode"] == "DETERMINISTIC_TOOL_PIPELINE"
         assert trace["toolCallCount"] >= 4
         tool_names = [item["tool"] for item in trace["toolCalls"]]
-        assert tool_names[0:2] == ["get_video_metadata", "search_timeline"]
+        assert tool_names[0:2] == ["get_video_metadata", "get_timeline_overview"]
         assert "get_evidence_window" in tool_names
         assert tool_names[-1] == "generate_report"
         assert evaluation["structuredValid"] is True
@@ -948,6 +948,7 @@ def test_logout_revokes_token_when_redis_is_available(monkeypatch: pytest.Monkey
 
 def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_history_lengths: list[int] = []
+    captured_evidence_timelines: list[str] = []
 
     class RememberingProvider(main.Provider):
         def analyze(self, transcript: str, goal: str) -> dict:
@@ -960,8 +961,10 @@ def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.Mo
             *,
             history: list[dict[str, str]] | None = None,
             memory_summary: str = "",
+            evidence_timeline: str = "",
         ) -> str:
             captured_history_lengths.append(len(history or []))
+            captured_evidence_timelines.append(evidence_timeline)
             return f"回答：{question}；历史消息={len(history or [])}"
 
     monkeypatch.setattr(main, "provider", lambda: RememberingProvider())
@@ -972,7 +975,14 @@ def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.Mo
         media_id = upload(client, owner, b"memory-video")
         with main.SessionLocal() as db:
             media = db.get(main.Media, media_id)
-            media.ai_summary = "报告说明数据库索引可以避免重复数据。"
+            media.ai_summary = "视频未提供足够证据，无法从视频确定答案。"
+            main.replace_evidence(db, media_id, [{
+                "segmentId": "asr-index",
+                "source": "ASR",
+                "startMs": 12000,
+                "endMs": 16000,
+                "content": "数据库索引能够加快查询并帮助定位重复数据。",
+            }])
             db.commit()
 
         first = client.post(
@@ -989,6 +999,7 @@ def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.Mo
         assert first.status_code == 200
         assert second.status_code == 200
         assert captured_history_lengths == [0, 2]
+        assert all("数据库索引能够加快查询" in item for item in captured_evidence_timelines)
         memory = client.get("/analysis/agent-memory", params={"id": media_id}, headers=owner).json()
         assert memory["sessionId"]
         assert memory["messageCount"] == 4
@@ -1002,7 +1013,6 @@ def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.Mo
             "assistant",
         ]
         assert "索引有什么作用" in memory["summary"]
-
         with main.SessionLocal() as db:
             second_goal = "从另一个分析目标继续追问"
             media = db.get(main.Media, media_id)
@@ -1047,6 +1057,31 @@ def test_follow_up_persists_user_scoped_short_term_memory(monkeypatch: pytest.Mo
         with main.SessionLocal() as db:
             assert db.scalar(main.select(main.AgentSession)) is None
             assert db.scalar(main.select(main.AgentMessage)) is None
+
+
+def test_model_follow_up_forces_disclaimer_for_grounded_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = main.OpenAICompatibleProvider("https://example.com/v1", "test-key", "test-model")
+    monkeypatch.setattr(provider, "_completion", lambda messages, tools=None, tool_choice=None: {
+        "content": None,
+        "tool_calls": [{
+            "function": {
+                "name": "submit_follow_up_answer",
+                "arguments": json.dumps({
+                    "answerBasis": "GROUNDED_INFERENCE",
+                    "answer": "更看重高质量通宝时，普通不期可能更合适。",
+                }, ensure_ascii=False),
+            },
+        }],
+    })
+
+    answer = provider.follow_up(
+        "视频比较了普通不期和紧急不期。",
+        "如果更看重高质量通宝，会更推荐哪一个？",
+        evidence_timeline="[120000-130000ms][ASR] 普通不期的高质量通宝概率更高。",
+    )
+
+    assert answer.startswith("更看重高质量通宝时")
+    assert answer.endswith("此答案为基于视频证据的推测，视频没有明确说明。")
 
 
 def test_production_mode_rejects_unsafe_configuration(monkeypatch: pytest.MonkeyPatch) -> None:

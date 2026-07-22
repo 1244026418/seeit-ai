@@ -13,9 +13,30 @@ ReportNormalizer = Callable[[dict[str, Any]], dict[str, Any]]
 ReportEvaluator = Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]]
 
 
+def is_summary_goal(goal: str) -> bool:
+    """Return whether the user asks for a broad video-level synthesis."""
+    normalized = re.sub(r"\s+", "", str(goal)).strip()
+    patterns = (
+        r"(?:这个|该|本|这段)?视频(?:主要)?(?:讲|说|介绍|讨论|分析)(?:了)?(?:些)?什么",
+        r"(?:这个|该|本|这段)?视频(?:的)?(?:主要|核心)?内容(?:是|有)?什么",
+        r"(?:总结|概括|综述|梳理|理解).{0,10}(?:视频|主要内容|核心内容|核心观点)",
+        r"(?:生成|整理)(?:一份)?(?:学习笔记|视频摘要)",
+        r"提炼(?:视频)?(?:核心观点|主要观点|关键结论)",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
 def build_agent_plan(goal: str) -> dict[str, Any]:
     normalized = re.sub(r"\s+", " ", goal).strip()
-    if re.search(r"会议|决策|待办|负责人|风险", normalized):
+    if is_summary_goal(normalized):
+        intent = "STRUCTURED_SUMMARY"
+        tasks = [
+            "读取视频元数据并确定总结范围",
+            "按时间轴抽取开头、中段和结尾的代表性 ASR/OCR 证据",
+            "综合视频主题、观点和示例生成结构化摘要",
+            "校验结论与代表性时间戳证据",
+        ]
+    elif re.search(r"会议|决策|待办|负责人|风险", normalized):
         intent = "MEETING_REVIEW"
         tasks = [
             "读取视频元数据并确认会议分析范围",
@@ -124,6 +145,20 @@ class AgentToolbox:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_timeline_overview",
+                    "description": "按视频时间轴均匀抽取有代表性的 ASR/OCR 证据，用于视频总结、主题概括和学习笔记。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "max_segments": {"type": "integer", "minimum": 4, "maximum": 20, "default": 18},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "search_timeline",
                     "description": (
                         "结合词法、语义和时间锚点检索 ASR/OCR 时间轴；多问句、枚举和分别题会返回"
@@ -212,6 +247,7 @@ class AgentToolbox:
         try:
             handlers = {
                 "get_video_metadata": self._get_video_metadata,
+                "get_timeline_overview": self._get_timeline_overview,
                 "search_timeline": self._search_timeline,
                 "get_evidence_window": self._get_evidence_window,
                 "verify_citations": self._verify_citations,
@@ -254,6 +290,91 @@ class AgentToolbox:
         if self._goal_evidence_sufficiency is None:
             return None
         return json.loads(json.dumps(self._goal_evidence_sufficiency, ensure_ascii=False))
+
+    @staticmethod
+    def _evenly_spaced(items: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+        if count <= 0 or not items:
+            return []
+        if len(items) <= count:
+            return list(items)
+        if count == 1:
+            return [items[len(items) // 2]]
+        indexes = {
+            round(index * (len(items) - 1) / (count - 1))
+            for index in range(count)
+        }
+        return [items[index] for index in sorted(indexes)]
+
+    def _get_timeline_overview(self, max_segments: int = 18) -> dict[str, Any]:
+        max_segments = max(4, min(int(max_segments), 20))
+        timeline = sorted(
+            (
+                item for item in self.segments
+                if item.get("source") != "SYSTEM" and item.get("content")
+            ),
+            key=lambda item: (int(item.get("startMs", 0)), str(item.get("segmentId", ""))),
+        )
+        deduplicated: list[dict[str, Any]] = []
+        seen_content: set[str] = set()
+        for item in timeline:
+            content_key = re.sub(r"\s+", "", str(item.get("content", ""))).lower()
+            if not content_key or content_key in seen_content:
+                continue
+            seen_content.add(content_key)
+            deduplicated.append(item)
+
+        asr = [item for item in deduplicated if str(item.get("source", "")).upper() == "ASR"]
+        ocr = [item for item in deduplicated if str(item.get("source", "")).upper() == "OCR"]
+        asr_budget = min(len(asr), max(1, round(max_segments * 2 / 3)))
+        ocr_budget = min(len(ocr), max_segments - asr_budget)
+        selected = [
+            *self._evenly_spaced(asr, asr_budget),
+            *self._evenly_spaced(ocr, ocr_budget),
+        ]
+        selected_ids = {str(item.get("segmentId")) for item in selected}
+        if len(selected) < max_segments:
+            remaining = [
+                item for item in deduplicated
+                if str(item.get("segmentId")) not in selected_ids
+            ]
+            selected.extend(self._evenly_spaced(remaining, max_segments - len(selected)))
+        selected = sorted(
+            selected[:max_segments],
+            key=lambda item: (int(item.get("startMs", 0)), str(item.get("segmentId", ""))),
+        )
+        return {
+            "ok": True,
+            "samplingMode": "REPRESENTATIVE_TIMELINE_V1",
+            "segmentCount": len(selected),
+            "sourceCounts": {
+                "ASR": sum(str(item.get("source", "")).upper() == "ASR" for item in selected),
+                "OCR": sum(str(item.get("source", "")).upper() == "OCR" for item in selected),
+            },
+            "segments": selected,
+        }
+
+    def evidence_for_question(self, question: str, max_segments: int = 18) -> list[dict[str, Any]]:
+        if is_summary_goal(question):
+            return list(self._get_timeline_overview(max_segments=max_segments)["segments"])
+
+        result = self._search_timeline(question, top_k=min(8, max_segments))
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for match in result.get("matches", [])[:4]:
+            window = self._get_evidence_window(
+                timestamp_ms=int(match.get("startMs", 0)),
+                before_ms=15000,
+                after_ms=15000,
+            )
+            for item in window.get("segments", []):
+                segment_id = str(item.get("segmentId"))
+                if segment_id in seen:
+                    continue
+                selected.append(item)
+                seen.add(segment_id)
+                if len(selected) >= max_segments:
+                    return selected
+        return selected or list(result.get("matches", [])[:max_segments])
 
     def _merge_goal_coverage(self, matches: list[dict[str, Any]]) -> None:
         state = self._goal_evidence_sufficiency

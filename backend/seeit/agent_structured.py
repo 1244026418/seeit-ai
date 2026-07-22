@@ -9,12 +9,12 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from seeit.agent import AgentToolbox, build_agent_plan
+from seeit.agent import AgentToolbox, build_agent_plan, is_summary_goal
 from seeit.agent_graph import extract_goal_timestamps_ms
 from seeit.retrieval import plan_evidence_requirements
 
 
-PROMPT_VERSION = "video-evidence-agent-v5.1-bounded-closeout"
+PROMPT_VERSION = "video-evidence-agent-v5.2-grounded-synthesis"
 MAX_REQUIREMENTS = 6
 MAX_LEDGER_EVIDENCE = 18
 MAX_EVIDENCE_CONTENT = 360
@@ -65,7 +65,7 @@ PLAN_SCHEMA = _tool_schema(
         "properties": {
             "answerMode": {
                 "type": "string",
-                "enum": ["SINGLE", "MULTI_PART", "EXHAUSTIVE_LIST", "COMPARISON", "SEQUENCE", "TEMPORAL"],
+                "enum": ["SINGLE", "MULTI_PART", "EXHAUSTIVE_LIST", "COMPARISON", "SEQUENCE", "TEMPORAL", "SYNTHESIS"],
             },
             "requirements": {
                 "type": "array",
@@ -79,11 +79,11 @@ PLAN_SCHEMA = _tool_schema(
                         "retrievalQuery": {"type": "string"},
                         "evidenceRole": {
                             "type": "string",
-                            "enum": ["DIRECT", "COMPARE_LEFT", "COMPARE_RIGHT", "ENUMERATION", "EXCLUSION", "TEMPORAL", "SEQUENCE_STEP"],
+                            "enum": ["DIRECT", "COMPARE_LEFT", "COMPARE_RIGHT", "ENUMERATION", "EXCLUSION", "TEMPORAL", "SEQUENCE_STEP", "SYNTHESIS"],
                         },
                         "completionPolicy": {
                             "type": "string",
-                            "enum": ["DIRECT", "ALL_RELEVANT", "COMPARE_SIDE", "EXCLUSION_SET", "TEMPORAL_WINDOW", "ORDERED_STEP"],
+                            "enum": ["DIRECT", "ALL_RELEVANT", "COMPARE_SIDE", "EXCLUSION_SET", "TEMPORAL_WINDOW", "ORDERED_STEP", "REPRESENTATIVE"],
                         },
                         "expectedSources": {
                             "type": "array",
@@ -127,6 +127,10 @@ VERIFICATION_SCHEMA = _tool_schema(
                         "requirementId": {"type": "string"},
                         "supported": {"type": "boolean"},
                         "complete": {"type": "boolean"},
+                        "supportLevel": {
+                            "type": "string",
+                            "enum": ["DIRECT", "SYNTHESIS", "GROUNDED_INFERENCE", "NONE"],
+                        },
                         "evidenceIds": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -143,6 +147,7 @@ VERIFICATION_SCHEMA = _tool_schema(
                         "requirementId",
                         "supported",
                         "complete",
+                        "supportLevel",
                         "evidenceIds",
                         "missingInformation",
                         "contradictionEvidenceIds",
@@ -289,6 +294,8 @@ def _tool_arguments(message: dict[str, Any], expected_name: str) -> dict[str, An
 
 
 def _fallback_evidence_plan(goal: str) -> dict[str, Any]:
+    if is_summary_goal(goal):
+        return _summary_evidence_plan(goal)
     raw = plan_evidence_requirements(goal)
     answer_mode = "SINGLE"
     if raw.get("strategy") == "COMPARISON_DECOMPOSITION":
@@ -334,10 +341,25 @@ def _fallback_evidence_plan(goal: str) -> dict[str, Any]:
     return {"answerMode": answer_mode, "requirements": requirements}
 
 
+def _summary_evidence_plan(goal: str) -> dict[str, Any]:
+    return {
+        "answerMode": "SYNTHESIS",
+        "requirements": [{
+            "requirementId": "summary",
+            "subQuestion": "概括视频主要内容、核心观点和关键示例",
+            "retrievalQuery": "视频主题 核心观点 关键内容 示例 总结",
+            "evidenceRole": "SYNTHESIS",
+            "completionPolicy": "REPRESENTATIVE",
+            "expectedSources": ["ASR", "OCR"],
+            "required": True,
+        }],
+    }
+
+
 def _normalize_evidence_plan(value: dict[str, Any] | None, goal: str) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    allowed_modes = {"SINGLE", "MULTI_PART", "EXHAUSTIVE_LIST", "COMPARISON", "SEQUENCE", "TEMPORAL"}
+    allowed_modes = {"SINGLE", "MULTI_PART", "EXHAUSTIVE_LIST", "COMPARISON", "SEQUENCE", "TEMPORAL", "SYNTHESIS"}
     answer_mode = str(value.get("answerMode") or "").upper()
     if answer_mode not in allowed_modes:
         return None
@@ -363,8 +385,8 @@ def _normalize_evidence_plan(value: dict[str, Any] | None, goal: str) -> dict[st
         raw_requirements = (targeted or raw_requirements[-1:])[:1]
     requirements = []
     seen: set[str] = set()
-    allowed_roles = {"DIRECT", "COMPARE_LEFT", "COMPARE_RIGHT", "ENUMERATION", "EXCLUSION", "TEMPORAL", "SEQUENCE_STEP"}
-    allowed_policies = {"DIRECT", "ALL_RELEVANT", "COMPARE_SIDE", "EXCLUSION_SET", "TEMPORAL_WINDOW", "ORDERED_STEP"}
+    allowed_roles = {"DIRECT", "COMPARE_LEFT", "COMPARE_RIGHT", "ENUMERATION", "EXCLUSION", "TEMPORAL", "SEQUENCE_STEP", "SYNTHESIS"}
+    allowed_policies = {"DIRECT", "ALL_RELEVANT", "COMPARE_SIDE", "EXCLUSION_SET", "TEMPORAL_WINDOW", "ORDERED_STEP", "REPRESENTATIVE"}
     for index, item in enumerate(raw_requirements[:MAX_REQUIREMENTS], start=1):
         if not isinstance(item, dict):
             continue
@@ -409,15 +431,25 @@ def _plan_node(provider: Any, state: StructuredAgentState) -> dict[str, Any]:
         "涉及‘有但没有/除了’时使用 EXCLUSION_SET；时间指代使用 TEMPORAL_WINDOW。"
     )
     prompt = system + "\n用户问题：" + goal
-    message = _forced_completion(provider, [{"role": "system", "content": system}, {"role": "user", "content": goal}], PLAN_SCHEMA)
-    planned = _normalize_evidence_plan(_tool_arguments(message, "submit_evidence_plan"), goal)
-    planner_mode = "LLM_STRUCTURED" if planned else "DETERMINISTIC_FALLBACK"
-    evidence_plan = planned or _fallback_evidence_plan(goal)
+    if is_summary_goal(goal):
+        evidence_plan = _summary_evidence_plan(goal)
+        planner_mode = "DETERMINISTIC_SUMMARY"
+        planner_calls = 0
+    else:
+        message = _forced_completion(
+            provider,
+            [{"role": "system", "content": system}, {"role": "user", "content": goal}],
+            PLAN_SCHEMA,
+        )
+        planned = _normalize_evidence_plan(_tool_arguments(message, "submit_evidence_plan"), goal)
+        planner_mode = "LLM_STRUCTURED" if planned else "DETERMINISTIC_FALLBACK"
+        evidence_plan = planned or _fallback_evidence_plan(goal)
+        planner_calls = 1
     return {
         "plan": build_agent_plan(goal),
         "evidence_plan": evidence_plan,
         "planner_mode": planner_mode,
-        "model_calls": int(state.get("model_calls", 0)) + 1,
+        "model_calls": int(state.get("model_calls", 0)) + planner_calls,
         "context_chars": {**state.get("context_chars", {}), "planner": len(prompt)},
     }
 
@@ -455,7 +487,18 @@ def _retrieve_node(toolbox: AgentToolbox, state: StructuredAgentState) -> dict[s
         if stored["evidenceId"] not in ids:
             ids.append(stored["evidenceId"])
 
-    for requirement in plan["requirements"]:
+    requirements_to_search = plan["requirements"]
+    if plan.get("answerMode") == "SYNTHESIS":
+        overview = toolbox.execute("get_timeline_overview", {"max_segments": MAX_LEDGER_EVIDENCE})
+        overview_segments = [dict(item) for item in overview.get("segments", [])]
+        for requirement in plan["requirements"]:
+            requirement_id = str(requirement["requirementId"])
+            raw_candidate_counts[requirement_id] = len(overview_segments)
+            for item in overview_segments:
+                add_segment(item, requirement_id)
+        requirements_to_search = []
+
+    for requirement in requirements_to_search:
         requirement_id = str(requirement["requirementId"])
         result = toolbox.execute("search_timeline", {
             "query": str(requirement["retrievalQuery"]),
@@ -568,6 +611,16 @@ def _normalize_verification(
         ]
         supported = bool(raw.get("supported")) and bool(evidence_ids)
         complete = bool(raw.get("complete")) and supported and not contradiction_ids
+        raw_support_level = str(raw.get("supportLevel") or "").upper()
+        allowed_support_levels = {"DIRECT", "SYNTHESIS", "GROUNDED_INFERENCE", "NONE"}
+        if not supported:
+            support_level = "NONE"
+        elif raw_support_level in allowed_support_levels - {"NONE"}:
+            support_level = raw_support_level
+        elif plan.get("answerMode") == "SYNTHESIS":
+            support_level = "SYNTHESIS"
+        else:
+            support_level = "DIRECT"
         explanation = str(raw.get("missingInformation") or "")[:500]
         consistency_repaired = False
         if not supported and not contradiction_ids and (
@@ -584,12 +637,14 @@ def _normalize_verification(
                 evidence_ids = list(dict.fromkeys(repaired_ids))
                 supported = True
                 complete = True
+                support_level = "DIRECT"
                 explanation = ""
                 consistency_repaired = True
         requirements.append({
             "requirementId": requirement_id,
             "supported": supported,
             "complete": complete,
+            "supportLevel": support_level,
             "evidenceIds": list(dict.fromkeys(evidence_ids)),
             "missingInformation": explanation,
             "contradictionEvidenceIds": list(dict.fromkeys(contradiction_ids)),
@@ -600,6 +655,9 @@ def _normalize_verification(
     }
     complete_ids = {item["requirementId"] for item in requirements if item["complete"]}
     overall_sufficient = bool(required_ids) and required_ids <= complete_ids
+    refusal_reason = "" if overall_sufficient else str(
+        (value or {}).get("refusalReason") or "必要证据槽位不完整"
+    )[:500]
     return {
         "policy": "LLM_SLOT_ENTAILMENT_WITH_DETERMINISTIC_ID_GATE_V1",
         "requirements": requirements,
@@ -608,7 +666,7 @@ def _normalize_verification(
         "overallSufficient": overall_sufficient,
         "fullyCovered": overall_sufficient,
         "shouldRefuse": not overall_sufficient,
-        "refusalReason": str((value or {}).get("refusalReason") or "必要证据槽位不完整")[:500],
+        "refusalReason": refusal_reason,
     }
 
 
@@ -654,6 +712,10 @@ def _verify_node(provider: Any, state: StructuredAgentState) -> dict[str, Any]:
         "可以结合相邻上下文理解明显的 ASR/OCR 同音错字、音译和断句错误，但不得补充证据中完全不存在的名称或数值。"
         "当问题与相邻证据已建立同一对象时，品牌全称、简称和版本名（例如品牌名与其 K3 版本）属于同一实体，"
         "不能仅因一处使用简称、另一处使用版本名而判定无关联。"
+        "SYNTHESIS/REPRESENTATIVE 是视频级概括：只要跨时间位置的多条代表性证据能建立连贯主题和主要观点，"
+        "即可 complete=true、supportLevel=SYNTHESIS；不要求穷尽视频每句话，也不能凭空增加行动建议槽位。"
+        "当证据没有逐字给出答案、但结论可以完全由给定证据合理推出时，可标记 supportLevel=GROUNDED_INFERENCE；"
+        "这种推断不得依赖视频外常识。直接陈述使用 DIRECT，完全不支持使用 NONE。"
     )
     payload = {"plan": plan, "ledger": ledger}
     prompt = system + "\n" + _json(payload)
@@ -680,6 +742,8 @@ def _verify_node(provider: Any, state: StructuredAgentState) -> dict[str, Any]:
             "如果证据只说‘这篇论文的技术、这个方法、该技术’，必须继续组合相邻 Evidence 找到被指代的"
             "具体名称，并同时引用指代句与名称所在证据，不能只引用悬空指代句。"
             "如果候选确实包含主体、关系和答案，必须 supported=true、complete=true 并列出证据 ID。"
+            "允许仅由现有证据推出的 GROUNDED_INFERENCE，但不能使用外部常识；视频级概括使用 SYNTHESIS，"
+            "代表性证据足以覆盖主要主题时不应因无法穷尽全部内容而拒答。"
         )
         audit_payload = {
             "question": state.get("goal"),
@@ -746,6 +810,9 @@ def _write_node(provider: Any, state: StructuredAgentState, *, revision: bool = 
         "如果证据明确给出了技术、方法或模型的名称，finalAnswer 必须保留该规范名称，不能只改述工作原理。"
         "对上下文已能唯一确认的 ASR/OCR 同音错字或音译错误，应在答案中改写为规范术语"
         "（例如‘善象文’写为‘上下文’、‘模太/多摩太’写为‘模态/多模态’），引用仍保留原始证据。"
+        "SYNTHESIS 是对多条代表性证据的概括，不等于无依据猜测；应直接总结视频主要内容并引用关键时间点。"
+        "如果 Verifier 将任一必要槽位标为 GROUNDED_INFERENCE，可以回答，但必须明确说明"
+        "‘此答案为基于视频证据的推测，视频没有明确说明’，不得伪装成视频原话。"
     )
     payload: dict[str, Any] = {
         "question": state.get("goal"),
@@ -763,6 +830,13 @@ def _write_node(provider: Any, state: StructuredAgentState, *, revision: bool = 
         REPORT_SCHEMA,
     )
     draft = _normalize_draft(_tool_arguments(message, "submit_grounded_report"))
+    has_grounded_inference = any(
+        item.get("complete") and item.get("supportLevel") == "GROUNDED_INFERENCE"
+        for item in state["verification"].get("requirements", [])
+    )
+    inference_disclaimer = "此答案为基于视频证据的推测，视频没有明确说明。"
+    if draft.get("answerable") and has_grounded_inference and inference_disclaimer not in draft["finalAnswer"]:
+        draft["finalAnswer"] = (draft["finalAnswer"].rstrip("。") + "。" + inference_disclaimer)[:2000]
     if state["verification"].get("shouldRefuse") and not draft.get("answerable"):
         canonical_refusal = "视频未提供足够证据，无法从视频确定答案。"
         draft["finalAnswer"] = canonical_refusal
@@ -819,6 +893,8 @@ def _critic_node(provider: Any, toolbox: AgentToolbox, state: StructuredAgentSta
         "此时槽位没有被证据覆盖是正确拒答的原因，allRequiredSlotsCovered 可以为 false，"
         "但 approved 和 answerabilityCorrect 应在拒答合规时为 true。"
         "把上下文中可唯一确认的 ASR/OCR 同音错字改成规范术语不属于外部知识，不能仅因此拒绝答案。"
+        "SYNTHESIS 可以基于跨时间位置的代表性证据概括主题；GROUNDED_INFERENCE 只有在答案明确标注"
+        "视频未直接说明且推断完全可由引用证据推出时才允许通过。"
     )
     payload = {
         "question": state.get("goal"),

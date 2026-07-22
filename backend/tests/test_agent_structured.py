@@ -9,6 +9,7 @@ from seeit.agent_structured import (
     _normalize_verification,
     _retrieve_node,
     _verification_needs_deictic_audit,
+    _write_node,
     run_structured_evidence_agent,
 )
 
@@ -236,7 +237,7 @@ def test_structured_agent_covers_each_comparison_slot_with_evidence_ids() -> Non
 
     graph = result["agentGraph"]
     assert result["accepted"] is True
-    assert graph["promptVersion"] == "video-evidence-agent-v5.1-bounded-closeout"
+    assert graph["promptVersion"] == "video-evidence-agent-v5.2-grounded-synthesis"
     assert graph["evidencePlan"]["answerMode"] == "COMPARISON"
     assert graph["evidenceVerification"]["fullyCovered"] is True
     assert len(graph["evidenceVerification"]["completeRequirementIds"]) == 2
@@ -539,6 +540,139 @@ def test_structured_agent_refuses_when_title_is_related_but_answer_is_missing() 
     assert result["report"]["finalAnswer"] == "视频未提供足够证据，无法从视频确定答案。"
     assert "无法从视频确定答案" in result["report"]["finalAnswer"]
     assert result["agentGraph"]["evidenceVerification"]["shouldRefuse"] is True
+
+
+class SummaryProvider:
+    def __init__(self) -> None:
+        self.phase_names: list[str] = []
+
+    def _completion(self, messages, tools=None, tool_choice=None):
+        name = tool_choice["function"]["name"]
+        self.phase_names.append(name)
+        payload = json.loads(messages[-1]["content"])
+        if name == "submit_evidence_verification":
+            evidence_ids = [item["evidenceId"] for item in payload["ledger"]["evidence"][:6]]
+            return tool_response(name, {
+                "requirements": [{
+                    "requirementId": "summary",
+                    "supported": True,
+                    "complete": True,
+                    "supportLevel": "SYNTHESIS",
+                    "evidenceIds": evidence_ids,
+                    "missingInformation": "",
+                    "contradictionEvidenceIds": [],
+                }],
+                "overallSufficient": True,
+                "shouldRefuse": False,
+                "refusalReason": "",
+            })
+        if name == "submit_grounded_report":
+            evidence_ids = payload["verification"]["requirements"][0]["evidenceIds"]
+            return tool_response(name, {
+                "answerable": True,
+                "finalAnswer": "视频围绕游戏机制展开，依次分析机制表现、实战影响和作者结论。",
+                "title": "视频主要内容",
+                "conclusions": ["视频讨论了游戏机制及其实战影响。"],
+                "evidenceIds": evidence_ids,
+                "suggestions": [],
+            })
+        if name == "submit_critic_review":
+            return tool_response(name, {
+                "approved": True,
+                "answerabilityCorrect": True,
+                "allRequiredSlotsCovered": True,
+                "contradictionFree": True,
+                "externalKnowledgeFree": True,
+                "citationIdsValid": True,
+                "missingRequirementIds": [],
+                "unsupportedClaims": [],
+                "contradictions": [],
+                "revisionInstruction": "",
+            })
+        raise AssertionError(name)
+
+
+def test_video_summary_uses_representative_timeline_without_planner_over_decomposition() -> None:
+    segments = [
+        {
+            "segmentId": f"asr-{index}",
+            "source": "ASR",
+            "startMs": index * 10000,
+            "endMs": index * 10000 + 5000,
+            "content": f"第 {index} 段游戏机制讲解",
+        }
+        for index in range(12)
+    ] + [
+        {
+            "segmentId": f"ocr-{index}",
+            "source": "OCR",
+            "startMs": index * 20000,
+            "endMs": index * 20000 + 1000,
+            "content": f"机制参数画面 {index}",
+        }
+        for index in range(6)
+    ]
+    provider = SummaryProvider()
+    current_toolbox = toolbox(segments)
+
+    result = run_structured_evidence_agent(provider, current_toolbox, "这个视频主要讲了什么？")
+
+    graph = result["agentGraph"]
+    assert result["report"]["answerable"] is True
+    assert graph["plannerMode"] == "DETERMINISTIC_SUMMARY"
+    assert graph["evidencePlan"]["answerMode"] == "SYNTHESIS"
+    assert graph["evidencePlan"]["requirements"][0]["completionPolicy"] == "REPRESENTATIVE"
+    assert graph["evidenceLedger"]["statistics"]["compactEvidenceCount"] == 18
+    assert graph["evidenceVerification"]["refusalReason"] == ""
+    assert "submit_evidence_plan" not in provider.phase_names
+    assert current_toolbox.trace()[0]["tool"] == "get_timeline_overview"
+
+
+def test_grounded_inference_writer_appends_explicit_uncertainty_notice() -> None:
+    class InferenceWriter:
+        def _completion(self, messages, tools=None, tool_choice=None):
+            return tool_response("submit_grounded_report", {
+                "answerable": True,
+                "finalAnswer": "作者可能认为这个机制的收益低于风险。",
+                "title": "机制判断",
+                "conclusions": ["收益可能低于风险。"],
+                "evidenceIds": ["E001"],
+                "suggestions": [],
+            })
+
+    state = {
+        "goal": "作者是否推荐使用这个机制？",
+        "evidence_plan": {"answerMode": "SINGLE", "requirements": []},
+        "verification": {
+            "overallSufficient": True,
+            "shouldRefuse": False,
+            "requirements": [{
+                "requirementId": "R1",
+                "complete": True,
+                "supportLevel": "GROUNDED_INFERENCE",
+                "evidenceIds": ["E001"],
+            }],
+        },
+        "evidence_ledger": {
+            "evidence": [{
+                "evidenceId": "E001",
+                "segmentId": "asr-1",
+                "source": "ASR",
+                "startMs": 10000,
+                "endMs": 15000,
+                "content": "这个机制虽然有收益，但失败后的代价很高。",
+            }],
+        },
+        "model_calls": 0,
+        "context_chars": {},
+    }
+
+    written = _write_node(InferenceWriter(), state)
+
+    assert written["draft_report"]["answerable"] is True
+    assert written["draft_report"]["finalAnswer"].endswith(
+        "此答案为基于视频证据的推测，视频没有明确说明。"
+    )
 
 
 class InvalidCitationProvider(ComparisonProvider):

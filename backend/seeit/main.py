@@ -33,7 +33,7 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from seeit.agent import AgentToolbox, build_agent_plan
+from seeit.agent import AgentToolbox, build_agent_plan, is_summary_goal
 from seeit.agent_graph import run_langgraph_agent
 from seeit.agent_structured import AgentQualityGateError, run_structured_evidence_agent
 from seeit.bilibili import (
@@ -278,7 +278,7 @@ class AuthRequest(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
-    goal: str = Field(default="理解视频核心内容并生成结构化分析报告", max_length=500)
+    goal: str = Field(default="概括视频主要内容和核心观点，并引用有代表性的时间戳证据", max_length=500)
 
 
 class BilibiliRequest(BaseModel):
@@ -415,13 +415,19 @@ class Provider:
         *,
         history: Optional[list[dict[str, str]]] = None,
         memory_summary: str = "",
+        evidence_timeline: str = "",
     ) -> str:
         raise NotImplementedError
 
     def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
         toolbox.execute("get_video_metadata")
-        search = toolbox.execute("search_timeline", {"query": goal, "top_k": 8})
-        matches = search.get("matches", []) if search.get("ok") else []
+        if is_summary_goal(goal):
+            overview = toolbox.execute("get_timeline_overview", {"max_segments": 18})
+            search = {"fallbackToTimelineStart": False}
+            matches = overview.get("segments", []) if overview.get("ok") else []
+        else:
+            search = toolbox.execute("search_timeline", {"query": goal, "top_k": 8})
+            matches = search.get("matches", []) if search.get("ok") else []
         timeline = [item for item in toolbox.segments if item.get("source") != "SYSTEM"]
         anchor_matches: list[dict[str, Any]] = []
         if timeline:
@@ -542,10 +548,12 @@ class MockProvider(Provider):
         *,
         history: Optional[list[dict[str, str]]] = None,
         memory_summary: str = "",
+        evidence_timeline: str = "",
     ) -> str:
         turn_count = len(history or []) // 2
         memory_note = f"，并参考了此前 {turn_count} 轮追问" if turn_count else ""
-        return f"## 追问结果\n\n问题：{question}\n\n基于当前报告{memory_note}：\n\n{report[:3000]}"
+        evidence_note = f"\n\n原始视频证据：\n{evidence_timeline[:3000]}" if evidence_timeline else ""
+        return f"## 追问结果\n\n问题：{question}\n\n基于当前报告{memory_note}：\n\n{report[:3000]}{evidence_note}"
 
 
 class OpenAICompatibleProvider(Provider):
@@ -698,24 +706,83 @@ class OpenAICompatibleProvider(Provider):
         *,
         history: Optional[list[dict[str, str]]] = None,
         memory_summary: str = "",
+        evidence_timeline: str = "",
     ) -> str:
         messages: list[dict[str, Any]] = [{
             "role": "system",
             "content": (
                 "你是 SeeIt AI 的多轮视频问答 Agent。只能根据已有报告和对话中出现的证据回答；"
-                "信息不足时明确说明，不得编造视频内容或时间戳。"
+                "同时优先使用本轮提供的原始 ASR/OCR 时间轴。"
+                "对于‘主要讲了什么、总结视频’等概括题，应综合跨时间位置的代表性证据直接回答。"
+                "如果视频没有逐字说明，但答案能完全由给定视频证据合理推出，可以回答，"
+                "并在结尾明确写‘此答案为基于视频证据的推测，视频没有明确说明。’"
+                "无法由证据推出时才拒答，不得使用视频外知识或编造时间戳。"
             ),
         }, {
             "role": "user",
-            "content": f"视频分析报告：\n{report[:12000]}\n\n历史记忆摘要：\n{memory_summary[:4000]}",
+            "content": (
+                f"视频分析报告：\n{report[:10000]}\n\n"
+                f"本轮检索到的原始视频证据：\n{evidence_timeline[:10000]}\n\n"
+                f"历史记忆摘要：\n{memory_summary[:3000]}"
+            ),
         }]
         for item in (history or [])[-20:]:
             role = str(item.get("role") or "").lower()
             if role in {"user", "assistant"}:
                 messages.append({"role": role, "content": str(item.get("content") or "")[:4000]})
         messages.append({"role": "user", "content": question})
-        message = self._completion(messages)
-        return str(message.get("content") or "").strip()
+        follow_up_schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_follow_up_answer",
+                "description": "提交带证据基础分类的视频追问回答。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answerBasis": {
+                            "type": "string",
+                            "enum": ["EXPLICIT", "SYNTHESIS", "GROUNDED_INFERENCE", "UNANSWERABLE"],
+                        },
+                        "answer": {"type": "string", "minLength": 1, "maxLength": 4000},
+                    },
+                    "required": ["answerBasis", "answer"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        messages[0]["content"] += (
+            "回答前必须判断 answerBasis：视频直接陈述答案用 EXPLICIT；概括多条证据用 SYNTHESIS；"
+            "结论并非视频原话、而是由视频证据推导出来时必须用 GROUNDED_INFERENCE；"
+            "证据无法支持时用 UNANSWERABLE。条件假设、偏好选择和‘会更推荐’通常属于 GROUNDED_INFERENCE。"
+        )
+        message = self._completion(
+            messages,
+            [follow_up_schema],
+            tool_choice={"type": "function", "function": {"name": "submit_follow_up_answer"}},
+        )
+        arguments: dict[str, Any] = {}
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") != "submit_follow_up_answer":
+                continue
+            raw = function.get("arguments") or "{}"
+            try:
+                arguments = raw if isinstance(raw, dict) else json.loads(str(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                arguments = {}
+            break
+        answer = str(arguments.get("answer") or message.get("content") or "").strip()
+        basis = str(arguments.get("answerBasis") or "UNANSWERABLE").upper()
+        inference_cues = re.search(
+            r"如果|假如|意味着|可以推断|由此可见|更适合|会更|可能|推测|推断",
+            question,
+        )
+        disclaimer = "此答案为基于视频证据的推测，视频没有明确说明。"
+        if answer and (basis == "GROUNDED_INFERENCE" or inference_cues) and disclaimer not in answer:
+            answer = answer.rstrip("。") + "。\n\n" + disclaimer
+        if not answer:
+            return "视频证据不足，无法回答这个问题。"
+        return answer
 
     def run_agent(self, toolbox: AgentToolbox, goal: str) -> dict[str, Any]:
         pipeline = env("AGENT_PIPELINE_VERSION", "structured-v5").strip().lower()
@@ -2413,7 +2480,7 @@ def delete_media(id: int, user: User = Depends(current_user)) -> str:
 
 
 @app.post("/analysis/ai")
-def start_analysis(id: int, goal: str = Query(default="理解视频核心内容并生成结构化分析报告", max_length=500), user: User = Depends(current_user)) -> JSONResponse:
+def start_analysis(id: int, goal: str = Query(default="概括视频主要内容和核心观点，并引用有代表性的时间戳证据", max_length=500), user: User = Depends(current_user)) -> JSONResponse:
     enforce_rate_limit(f"analysis:{user.id}", 20, 3600)
     normalized_goal = goal.strip()
     if not normalized_goal:
@@ -2670,19 +2737,23 @@ def follow_up(id: int, question: str = Query(min_length=1, max_length=500), user
             goal=task.goal if task else "基于最新报告继续追问",
         )
         history = recent_agent_messages(db, session.id)
+        question_text = question.strip()
+        toolbox = agent_toolbox(db, media, ensure_evidence=False)
+        follow_up_evidence = toolbox.evidence_for_question(question_text, max_segments=18)
         answer = provider().follow_up(
             media.ai_summary,
-            question.strip(),
+            question_text,
             history=history,
             memory_summary=session.summary or "",
+            evidence_timeline=evidence_context(follow_up_evidence),
         )
         db.add_all([
-            AgentMessage(session_id=session.id, user_id=user.id, role="user", content=question.strip()),
+            AgentMessage(session_id=session.id, user_id=user.id, role="user", content=question_text),
             AgentMessage(session_id=session.id, user_id=user.id, role="assistant", content=answer),
         ])
         update_agent_memory_summary(session, [
             *history,
-            {"role": "user", "content": question.strip()},
+            {"role": "user", "content": question_text},
             {"role": "assistant", "content": answer},
         ])
         db.commit()

@@ -395,7 +395,7 @@ import { DEMO_EVALUATION, DEMO_ITEM, DEMO_PLAN, DEMO_RESULT, DEMO_TRACE } from '
 
 // --- 变量定义 ---
 const DEMO_MODE = new URLSearchParams(window.location.search).has('demo')
-const DEFAULT_GOAL = '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议'
+const DEFAULT_GOAL = '概括视频主要内容和核心观点，并引用有代表性的时间戳证据'
 const goalPresets = ['生成学习笔记', '提炼会议结论', '梳理操作步骤']
 const file = ref(null)
 const sourceMode = ref('local')

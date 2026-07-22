@@ -45,10 +45,10 @@ RocketMQ Python 客户端依赖本地动态库，本项目建议通过 Docker/Li
 - 使用 PaddlePaddle `3.2.2` 与 PaddleOCR `3.7.0` 的 `PP-OCRv5_mobile_det/rec` 抽取关键帧文字；ASR 后释放 Whisper 模型，并通过独立 OCR 子进程规避 CPU oneDNN 的非主线程限制，将 ASR/OCR 统一写入 EvidenceSegment 时间轴。
 - 发现历史媒体只有 SYSTEM 占位证据时，在 ASR 可用后自动重新构建时间轴；抽取式报告按型号、推理强度、价格、适用场景和建议等目标维度检索，并保留全片时间轴锚点。
 - 抽象 OpenAI 兼容 AI Provider，同时提供离线 Mock，方便无密钥演示。
-- 默认启用 LangGraph v5.1 结构化 Agent：LLM Planner 生成最多 6 个证据槽位，Retriever 批量构建最多 18 条压缩 Evidence Ledger，Verifier 逐槽位判断直接支持与完整性并允许一次假阴性/悬空指代审计，Writer 只能引用合法 Evidence ID，独立 Critic 检查漏项、矛盾、外部知识和拒答；一次修订后使用确定性门禁有界收尾，`AGENT_PIPELINE_VERSION=legacy-v4` 可回滚旧工具循环。
+- 默认启用 LangGraph v5.2 结构化 Agent：精确事实题由 LLM Planner 生成最多 6 个证据槽位；视频级总结使用确定性的 `SYNTHESIS + REPRESENTATIVE` 计划和全时间轴代表性采样。Verifier 区分直接证据、综合概括、有依据推断和无支持，Writer 只能引用合法 Evidence ID；Grounded Inference 由程序强制附加不确定性提示，完全无证据时仍安全拒答。独立 Critic 检查漏项、矛盾、外部知识和拒答，一次修订后使用确定性门禁有界收尾，`AGENT_PIPELINE_VERSION=legacy-v4` 可回滚旧工具循环。
 - 独立 Evidence Retriever 提供关键词/字符片段混合基线，输出分数明细；`backend/evals/evidence_rag_eval.json` 和脚本统计 Recall@K、MRR、Hit Rate。
 - 输出带时间戳证据的 Markdown 报告，并持久化动态计划、逐工具 Trace、图执行元数据、阶段耗时、引用支持率、继续追问和用户反馈；MySQL 使用 `LONGTEXT` 保存真实多轮工具调用 Trace。
-- 按用户、视频和分析目标持久化 AgentSession/AgentMessage；模型追问上下文默认取最近 12 条，历史查看每会话默认返回最近 200 条并标记是否截断。`GET /analysis/agent-memory` 同时返回最新会话和该视频的全部会话列表，`GET /media/list` 返回会话/消息计数与最近回复摘要，支持前端关闭后恢复和主页历史展示。
+- 按用户、视频和分析目标持久化 AgentSession/AgentMessage；模型追问上下文默认取最近 12 条，并针对本轮问题重新检索原始 ASR/OCR。追问使用结构化 `answerBasis` 区分直接回答、综合概括、有依据推断和无答案；推断回答由服务端确定性补充“视频没有明确说明”。历史查看每会话默认返回最近 200 条并标记是否截断。`GET /analysis/agent-memory` 同时返回最新会话和该视频的全部会话列表，`GET /media/list` 返回会话/消息计数与最近回复摘要，支持前端关闭后恢复和主页历史展示。
 - 运行独立 SeeIt MCP Server，通过用户 Bearer Token 暴露 14 个工具与 4 个资源模板，不直接访问数据库或绕过 FastAPI 权限边界。
 - 对模型异常提供最多 3 次有限重试；服务重启时会回收超时的 `PROCESSING` 任务。
 - 生产模式校验 JWT、MySQL、CORS 与 Alembic 配置，支持 Token 注销撤销和 Redis/内存双层接口限流。

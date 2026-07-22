@@ -18,13 +18,13 @@
 - RocketMQ 异步分析任务与独立 Worker
 - FFmpeg 音频提取、`faster-whisper base/int8` 本地 ASR、远程 ASR 兼容和 PaddleOCR 关键帧证据
 - 可替换的 AI Provider 与离线 Mock 演示
-- LangGraph 结构化 Agent 图：LLM Planner 生成证据槽位，批量 Retriever 构建 Evidence Ledger，Verifier 判断蕴含与充分性，Writer 使用 Evidence ID 成文，独立 Critic 检查完整性、矛盾、外部推断和拒答
+- LangGraph 结构化 Agent 图：事实题由 LLM Planner 生成证据槽位；视频总结走确定性代表性时间轴采样；Verifier 区分直接证据、综合概括、有依据推断和无答案，Writer 使用 Evidence ID 成文，独立 Critic 检查完整性、矛盾、外部推断和拒答
 - Coverage-Aware Agentic RAG：lexical + 本地 BGE dense + RRF，并对多问句、枚举和分别题建立证据需求计划、分需求检索、邻接扩展与充分性门禁
 - Qdrant 持久化向量索引，按视频和 ASR/OCR 来源过滤，支持快照复用、变化重建、媒体删除清理和故障降级
 - 合成/真实检索评测集，输出 Recall@K、MRR、多证据完整命中、无答案误召回、延迟和逐题结果
 - 模型工具调用与离线确定性工具流水线，统一执行元数据、时间轴检索、证据窗口、引用校验和报告生成
 - 动态分析计划、逐工具 Trace、图执行元数据、证据引用评估、继续追问和任务状态查询
-- 按用户/视频/目标隔离的 Agent 短期记忆，持久化追问会话；关闭侧栏或刷新页面后可恢复报告与对话，主页视频卡片展示会话摘要
+- 按用户/视频/目标隔离的 Agent 短期记忆，持久化追问会话；每次追问会重新检索原始 ASR/OCR，而不是只依赖上一份报告；有依据推断强制标注“视频没有明确说明”；关闭侧栏或刷新页面后可恢复报告与对话，主页视频卡片展示会话摘要
 - 带用户 Token 隔离的 SeeIt MCP Server，提供 14 个工具和 4 个资源模板
 - 课程笔记、会议复盘、操作指南和证据审计 4 个可复用 Agent Skill
 - Alembic 数据库迁移、失败重试、重复消息幂等和 Pytest 接口测试
@@ -125,7 +125,7 @@ cd backend
 pytest -q
 ```
 
-最近一次完整后端回归为 `103 passed, 2 skipped`；两个 skip 是需要外部 Qdrant 服务条件的集成项。覆盖上传与鉴权、任务重试、ASR/OCR、Retriever Profile、Qdrant 运行/降级、离线评测、结构化 Agent 槽位、Verifier 审计、Critic 有界收尾和 EvalOps 指标。
+最近一次完整后端回归为 `106 passed, 2 skipped`；两个 skip 是需要外部 Qdrant 服务条件的集成项。覆盖上传与鉴权、任务重试、ASR/OCR、Retriever Profile、Qdrant 运行/降级、离线评测、结构化 Agent 槽位、代表性视频总结、Grounded Inference 提示、Verifier 审计、Critic 有界收尾和 EvalOps 指标。
 
 证据 RAG 基线命令：
 
@@ -159,7 +159,7 @@ python scripts/evaluate_retrieval_ab.py \
 
 Coverage-Aware v2 随后在另一组冻结最终未见集（2 条新视频、16 题，其中 11 道可回答、5 道不可回答）上只运行一次。282 段 ASR/OCR 快照中的金标抽取覆盖率为 `1.0000`，但 lexical 的 MRR/Recall@8 为 `0.5682/0.6818`，Coverage-Aware 与 Qdrant Coverage 只有 `0.4651/0.5909`；11 道可回答题中 6 道完整命中，5 道不可回答题均未在检索层拒答。开发集上的提升没有泛化，`fullyCovered` 还错误地把每道可回答题都视为单一且已满足的 requirement。真实 DeepSeek 只做预算受控抽样：7/16 题完成、人工语义复核 3/7 通过，40 次请求累计 408,045 Token 后停止。该最终集已封存，不用于后续调参或重跑。
 
-针对上述失败，默认 Agent 已升级为 `video-evidence-agent-v5.1-bounded-closeout`。v5.1 不再依赖“检索到候选即 fullyCovered”：DeepSeek 先输出带 `completionPolicy` 的结构化槽位计划，系统按槽位批量检索并压缩为最多 18 条 Evidence Ledger，Verifier 逐槽位返回 `supported/complete/evidenceIds`，必要时执行一次假阴性/悬空指代审计，Writer 只能引用已存在的 Evidence ID，Critic 同时执行模型审查和确定性 ID/槽位门禁。Critic 最多修订一次；修订后若确定性门禁通过则有界接受，否则输出零引用安全拒答，避免把确定性质量失败完整重跑三次。可通过 `AGENT_PIPELINE_VERSION=legacy-v4` 回滚。
+默认 Agent 已升级为 `video-evidence-agent-v5.2-grounded-synthesis`。v5.2 保留 v5.1 的结构化槽位、Evidence Ledger、Verifier 审计和 Critic 有界收尾；同时将“视频主要讲了什么/总结视频”等开放式概括路由到单个 `SYNTHESIS + REPRESENTATIVE` 槽位，按时间轴均匀抽取最多 18 条 ASR/OCR，避免把时间戳或行动建议错误扩张成必须事实槽位。Verifier 的 `supportLevel` 区分 `DIRECT/SYNTHESIS/GROUNDED_INFERENCE/NONE`：仅由视频证据可推出的答案允许回答，但程序强制追加“视频没有明确说明”；完全没有证据的精确事实仍拒答。追问会重新检索原始时间轴，避免上一份拒答报告导致后续永久失去视频上下文。可通过 `AGENT_PIPELINE_VERSION=legacy-v4` 回滚旧工具循环。
 
 在完全相同的两段合成证据和比较问题上，真实 DeepSeek v4/v5 均 4 次请求且回答正确；v5 Prompt Token `7802 -> 4018`、Total Token `8459 -> 4828`，分别下降约 `48.5%/42.9%`，Tool Call `5 -> 4`，总 Provider 延迟 `7127 -> 7422 ms`。这是单次开发冒烟，不是性能压测；v4 有 6528 Cache Hit Token 而 v5 首次运行无缓存，且费用单价未配置，不能据此宣称实际账单下降。另一个“标题相关但未给答案”的合成场景中，v5 以 4 次请求、4062 Token 完成零引用明确拒答。
 

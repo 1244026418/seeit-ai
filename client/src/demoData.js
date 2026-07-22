@@ -7,7 +7,7 @@ export const DEMO_ITEM = {
 }
 
 export const DEMO_PLAN = {
-  understoodGoal: '理解视频核心内容，提炼关键结论，并给出带时间戳的证据和可执行建议',
+  understoodGoal: '概括视频主要内容和核心观点，并引用有代表性的时间戳证据',
   intent: 'STRUCTURED_SUMMARY',
   tasks: ['读取视频元数据并确定总结范围', '检索主题、观点和示例相关的时间轴证据', '展开关键证据窗口并生成结构化报告', '校验结论、引用和报告结构']
 }
