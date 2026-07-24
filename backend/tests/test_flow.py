@@ -1102,23 +1102,24 @@ def test_ffprobe_video_validation_and_duration_limit(monkeypatch: pytest.MonkeyP
         })
 
     monkeypatch.setattr(main.subprocess, "run", lambda *args, **kwargs: Completed())
-    monkeypatch.setenv("MAX_VIDEO_DURATION_SECONDS", "600")
+    monkeypatch.setenv("MAX_VIDEO_DURATION_SECONDS", "900")
     result = main.validate_video_file(Path("demo.mp4"))
     assert result["codec"] == "h264"
     assert result["durationSeconds"] == 120.5
 
     Completed.stdout = json.dumps({
         "streams": [{"codec_name": "h264", "width": 1920, "height": 1080}],
-        "format": {"duration": "601"},
+        "format": {"duration": "900"},
+    })
+    at_limit = main.validate_video_file(Path("at-limit.mp4"))
+    assert at_limit["durationSeconds"] == 900.0
+
+    Completed.stdout = json.dumps({
+        "streams": [{"codec_name": "h264", "width": 1920, "height": 1080}],
+        "format": {"duration": "901"},
     })
     with pytest.raises(ValueError, match="视频时长不能超过"):
         main.validate_video_file(Path("too-long.mp4"))
-
-    overridden = main.validate_video_file(
-        Path("bilibili-long.mp4"),
-        max_duration_seconds=900,
-    )
-    assert overridden["durationSeconds"] == 601.0
 
 
 def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1130,7 +1131,7 @@ def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: py
         "bvid": "BV1xx411c7mD",
         "title": "公开课程视频",
         "uploader": "测试作者",
-        "durationSeconds": 120,
+        "durationSeconds": 601,
         "coverUrl": "https://i0.hdslb.com/demo.jpg",
         "webpageUrl": "https://www.bilibili.com/video/BV1xx411c7mD",
     }
@@ -1141,6 +1142,7 @@ def test_bilibili_preview_uses_validated_bvid_and_duration_limit(monkeypatch: py
         response = client.post("/media/bilibili/preview", json={"bvid": "BV1xx411c7mD"}, headers=headers)
         assert response.status_code == 200
         assert response.json()["title"] == "公开课程视频"
+        assert response.json()["durationSeconds"] == 601
 
         monkeypatch.setattr(
             main,

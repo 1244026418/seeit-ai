@@ -147,7 +147,7 @@
               <span class="task-state-label">{{ importStateLabel(biliTask.state) }}</span>
             </div>
 
-            <p class="source-boundary">仅导入公开且你有权处理的视频，单条最长 10 分钟。</p>
+            <p class="source-boundary">仅导入公开且你有权处理的视频，单条最长 15 分钟。</p>
           </div>
         </div>
         <transition name="toast-pop">
